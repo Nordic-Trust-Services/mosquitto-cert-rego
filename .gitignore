@@ -57,3 +57,6 @@ policies/*.rego
 # OS artefacts
 .DS_Store
 Thumbs.db
+
+# Claude Code auto-memory (lives in-tree but is per-user, not shared)
+.claude-memory/

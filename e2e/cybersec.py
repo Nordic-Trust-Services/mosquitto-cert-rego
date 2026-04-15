@@ -500,6 +500,215 @@ def t_reload_race() -> None:
 
 
 # --------------------------------------------------------------------------
+# Property-based fuzzer over cert subjects / SANs / custom extensions
+# --------------------------------------------------------------------------
+
+@test("fuzz_cert_inputs_keep_audit_intact")
+def t_fuzz_inputs() -> None:
+    """Mint a stream of randomised client certificates (varying CN, O, OU
+    stack depth, SAN dns/email/uri counts and contents, custom extensions
+    with random OIDs and payloads) signed by intermediate_a, run a connect
+    for each, and assert across the run:
+
+      - broker process stays alive
+      - every audit line is valid JSON
+      - every connect line carries the required cert metadata fields
+      - reported `cn` either equals the configured CN exactly or is the
+        configured CN truncated with the unicode ellipsis (\u2026) — the
+        truncation helper is the only legitimate way the field can change
+      - `chain_ok` is true (we only mint validly-signed certs)
+      - `decision_id` is unique and monotonic across the run
+
+    Fixed RNG seed so failures reproduce."""
+    import datetime as _dt
+    import string
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID, ObjectIdentifier
+
+    rng = random.Random(1234567890)
+    ca_cert = x509.load_pem_x509_certificate((PKI/"intermediate_a.crt").read_bytes())
+    ca_key  = serialization.load_pem_private_key((PKI/"intermediate_a.key").read_bytes(), password=None)
+
+    pid = int((RUN/"broker.pid").read_text().strip())
+
+    # Pre-generate one shared RSA key — RSA keygen dwarfs everything else.
+    shared_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    shared_key_pem = shared_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    )
+
+    PRINTABLE = string.ascii_letters + string.digits + " -._~/+="
+    INJECT    = '"\\\b\f\n\r\t' + chr(0x01)
+
+    def rstr(min_n: int, max_n: int, alphabet: str) -> str:
+        n = rng.randint(min_n, max_n)
+        return "".join(rng.choice(alphabet) for _ in range(n))
+
+    def rand_subject() -> x509.Name:
+        attrs: list[x509.NameAttribute] = []
+        # CN length capped at 63 (X.520 ub-common-name) — long enough to
+        # exercise our 256-byte DN truncation when combined with OUs.
+        cn_alphabet = PRINTABLE + (INJECT if rng.random() < 0.3 else "")
+        attrs.append(x509.NameAttribute(NameOID.COMMON_NAME, rstr(1, 63, cn_alphabet)))
+        if rng.random() < 0.7:
+            attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME,
+                                            rstr(1, 32, PRINTABLE)))
+        # 0..6 OUs to push DN length toward (and past) the truncation budget.
+        for _ in range(rng.randint(0, 6)):
+            attrs.append(x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME,
+                                            rstr(1, 32, PRINTABLE)))
+        if rng.random() < 0.5:
+            attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, "US"))
+        return x509.Name(attrs)
+
+    def rand_san() -> list:
+        names = []
+        for _ in range(rng.randint(0, 4)):
+            names.append(x509.DNSName(rstr(1, 30, string.ascii_lowercase + "-.") + ".example"))
+        for _ in range(rng.randint(0, 3)):
+            names.append(x509.RFC822Name(f"{rstr(1, 16, string.ascii_lowercase)}@example.com"))
+        for _ in range(rng.randint(0, 2)):
+            names.append(x509.UniformResourceIdentifier(
+                "https://" + rstr(1, 30, string.ascii_lowercase + "/.") + ".test"))
+        return names
+
+    def rand_custom_ext():
+        # Random OID under a private arc.
+        oid = ObjectIdentifier(f"1.3.6.1.4.1.99999.{rng.randint(1, 999)}")
+        n = rng.randint(0, 64)
+        payload = bytes(rng.randint(0, 255) for _ in range(n))
+        return x509.UnrecognizedExtension(oid, payload)
+
+    def mint_cert(cn_subject: x509.Name) -> x509.Certificate:
+        sans = rand_san()
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(cn_subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(shared_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_dt.datetime(2024, 1, 1))
+            .not_valid_after(_dt.datetime(2034, 1, 1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=True,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(shared_key.public_key()), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+                critical=False,
+            )
+        )
+        if sans:
+            builder = builder.add_extension(x509.SubjectAlternativeName(sans), critical=False)
+        # 0..3 random custom extensions
+        for _ in range(rng.randint(0, 3)):
+            builder = builder.add_extension(rand_custom_ext(), critical=False)
+        return builder.sign(ca_key, hashes.SHA256())
+
+    fuzz_dir = RUN / "fuzz"
+    fuzz_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = fuzz_dir / "cert.pem"
+    key_path  = fuzz_dir / "key.pem"
+    key_path.write_bytes(shared_key_pem)
+    key_path.chmod(0o600)
+
+    reset_audit()
+
+    n_iters = 30
+    expected_cns = []
+    for i in range(n_iters):
+        subject = rand_subject()
+        cn_value = next(
+            a.value for a in subject if a.oid == NameOID.COMMON_NAME
+        )
+        expected_cns.append(cn_value)
+        cert = mint_cert(subject)
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+        # Use the existing operator policy from setup; fuzzed certs sign
+        # under intermediate_a so trust_anchor=root_a → operator role,
+        # so they should connect cleanly.
+        cmd = [
+            PUB, "-h", HOST, "-p", str(PORT),
+            "--cafile", str(PKI/"bundle_all.pem"),
+            "--tls-version", "tlsv1.2",
+            "--cert", str(cert_path), "--key", str(key_path),
+            "-i", f"fuzz-{i}",
+            "-t", f"devices/anything/{i}",
+            "-m", "x", "-q", "0", "--quiet",
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=5)
+
+    # Broker still alive?
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        raise TestFailure("broker died during fuzz run")
+
+    time.sleep(0.3)
+    lines = read_audit()  # raises if any line is malformed JSON
+
+    connects = [l for l in lines if l.get("event") == "connect"]
+    if len(connects) < n_iters:
+        raise TestFailure(
+            f"expected at least {n_iters} connect events, got {len(connects)}"
+        )
+
+    required_fields = {"cn", "subject_dn", "issuer_dn", "serial",
+                       "fingerprint_sha256", "chain_ok", "chain_errors",
+                       "client_id", "remote_addr", "decision_id"}
+
+    for ev in connects:
+        missing = required_fields - set(ev)
+        if missing:
+            raise TestFailure(f"connect line missing fields {missing}: {ev}")
+        if not ev.get("chain_ok"):
+            raise TestFailure(
+                f"validly-signed fuzzed cert has chain_ok=false: {ev}"
+            )
+
+    # cn round-trip: each emitted cn must either equal one of the
+    # configured CNs exactly, or be a configured CN truncated with the
+    # JSON ellipsis (\u2026 = …). Truncation budget is 256 bytes.
+    cn_set = set(expected_cns)
+    for ev in connects:
+        cn = ev.get("cn", "")
+        if cn in cn_set:
+            continue
+        if cn.endswith("\u2026"):
+            stem = cn[:-1]
+            if any(orig.startswith(stem) for orig in cn_set):
+                continue
+        # The fuzz mints unique CNs per iteration; if cn doesn't match
+        # any of our minted ones, the audit corrupted it.
+        raise TestFailure(
+            f"cn round-trip failed: audit cn={cn!r} not in fuzz CN set"
+        )
+
+    # decision_id monotonic and unique
+    ids = [ev["decision_id"] for ev in connects]
+    if sorted(set(ids)) != sorted(ids):
+        raise TestFailure(f"duplicate decision_id under fuzz: {ids}")
+    if ids != sorted(ids):
+        raise TestFailure(f"decision_id not monotonic: {ids}")
+
+
+# --------------------------------------------------------------------------
 # OCSP revocation
 # --------------------------------------------------------------------------
 

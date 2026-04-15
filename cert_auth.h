@@ -78,8 +78,33 @@ struct ca_ldap_config {
 };
 
 struct ca_audit_config {
+	/* File sink — empty/NULL disables. */
 	char *file_path;
 	bool fsync_per_line;
+
+	/* Syslog sink. ident defaults to "mosquitto-cert-rego" if empty;
+	 * facility default is "authpriv". */
+	bool syslog_enabled;
+	char *syslog_ident;
+	char *syslog_facility;
+
+	/* Threshold filter. INFO by default — emits per-decision lines with
+	 * core cert metadata, suitable for production with a relaxed policy.
+	 * NOTICE drops allow lines (deny-only). DEBUG adds chain dump, SAN,
+	 * custom OIDs, eval timing, and Rego-injected policy notes. */
+	int level;              /* enum audit_level value, kept as int to
+	                           avoid pulling audit_log.h into every TU. */
+
+	/* Hard per-line cap, bytes. Clamped to [AUDIT_LINE_MIN, AUDIT_LINE_MAX]. */
+	size_t line_cap_bytes;
+
+	/* DEBUG-only granular toggles. Each is consulted only when level
+	 * is DEBUG; below that they have no effect. */
+	bool include_chain_detail;
+	int  chain_detail_max_depth;   /* default 8 */
+	bool include_san;
+	bool include_custom_oids;
+	bool include_eval_timing;      /* elapsed_us per decision */
 };
 
 struct ca_rego_config {
@@ -274,6 +299,47 @@ char **ca_cert_crl_dp_urls(X509 *cert, size_t *count_out);
 char *ca_cert_input_json(X509 *leaf,
 		STACK_OF(X509) *chain,
 		const struct ca_verify_state *state);
+
+/* Build the always-on cert metadata fragment for an audit event. Emitted
+ * at INFO and above so liberal policies still leave a usable trail.
+ *
+ * Output is a JSON object body *without* surrounding braces:
+ *   "cn":"alice","subject_dn":"...","issuer_dn":"...",
+ *   "serial":"...","fingerprint_sha256":"...",
+ *   "trust_anchor_fp":"..." (or null when chain_ok=false),
+ *   "chain_ok":true|false,"chain_errors":["expired",...]
+ *
+ * DN strings are truncated to AUDIT_DN_MAX_CHARS to keep the line bounded.
+ * Returns NULL on OOM. Caller frees with mosquitto_free. */
+char *ca_cert_audit_core_extras(X509 *leaf,
+		STACK_OF(X509) *chain,
+		const struct ca_verify_state *state);
+
+/* Build the per-cert chain dump fragment for DEBUG-level audit. Emitted
+ * only when the operator opted in.
+ *
+ * Output is a JSON object body *without* surrounding braces:
+ *   "chain":[ {"depth":0,"subject_dn":"...","issuer_dn":"...",
+ *              "serial":"...","fingerprint_sha256":"...",
+ *              "not_before_unix":...,"not_after_unix":...,
+ *              "verify_ok":true|false,"errors":["expired",...]}, ... ]
+ *   [,"chain_truncated":true]
+ *
+ * Per-DN truncation uses AUDIT_DN_MAX_CHARS. The chain is capped at
+ * `max_depth` entries; if deeper, a "chain_truncated":true sibling key is
+ * appended after the array. Returns NULL on OOM. */
+char *ca_cert_audit_chain_extras(STACK_OF(X509) *chain,
+		const struct ca_verify_state *state,
+		int max_depth);
+
+/* Build the SAN dump fragment ("san":{"dns":[...],"email":[...],
+ * "uri":[...]}) for DEBUG-level audit. Returns NULL on OOM. */
+char *ca_cert_audit_san_extras(X509 *leaf);
+
+/* Build the custom-extensions dump fragment for DEBUG-level audit. Same
+ * shape as input.cert.custom_extensions but as an audit body fragment.
+ * Returns NULL on OOM. */
+char *ca_cert_audit_custom_oid_extras(X509 *leaf);
 
 /* =========================================================================
  * Chain verification and OCSP (ocsp_check.c)

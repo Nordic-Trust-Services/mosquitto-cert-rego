@@ -300,6 +300,45 @@ static Node builtin_crl_check(const Nodes& args)
 }
 
 
+/* audit.log(message_string)
+ *
+ * Lets a Rego policy attach a free-form note to the audit trail — typically
+ * the reason an unusual decision was made (e.g. "override accepted: expired
+ * intermediate during root rotation"). Emitted as a `policy.note` event at
+ * DEBUG level so it doesn't pollute INFO logging unless the operator opts in.
+ *
+ * The argument can be any string — policies wanting structured data should
+ * pass json.marshal(obj) and audit consumers can re-parse it.
+ *
+ * Returns true on success so policies can compose it inline:
+ *   allow { ...; audit.log("override:expired_intermediate") }
+ */
+static Node builtin_audit_log(const Nodes& args)
+{
+	if(!g_plugin || !g_plugin->audit){
+		/* No audit sink — return true so the policy still composes cleanly. */
+		return rego::boolean(true);
+	}
+
+	std::string msg;
+	Node err = unwrap_string(args, 0, msg);
+	if(err) return err;
+
+	if(msg.size() > 1024) msg.resize(1024);
+
+	char *esc = audit_log_escape_json_string(msg.c_str());
+	if(!esc) return rego::boolean(true);
+
+	std::string extras = "\"note\":";
+	extras += esc;
+	mosquitto_free(esc);
+
+	audit_log_event_at(g_plugin->audit, AUDIT_LEVEL_DEBUG,
+			"policy.note", nullptr, extras.c_str());
+	return rego::boolean(true);
+}
+
+
 /* ---- Declaration builders ------------------------------------------- */
 
 /* Build a Decl node with N string args and a boolean result. Used for
@@ -391,6 +430,13 @@ static void register_host_builtins(Interpreter& interp)
 			Location("crl.check"),
 			nullary_string_result_decl("JSON array of per-cert CRL status"),
 			&builtin_crl_check));
+
+	/* audit.log — DEBUG-level audit note from the policy. Returns bool so
+	 * it composes inside rule bodies. */
+	builtins.register_builtin(BuiltInDef::create(
+			Location("audit.log"),
+			bool_result_decl({"message"}),
+			&builtin_audit_log));
 }
 
 } /* anonymous namespace */

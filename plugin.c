@@ -204,6 +204,8 @@ static void config_free(struct ca_config *cfg)
 	free_csv(cfg->ldap.allowed_urls, cfg->ldap.allowed_url_count);
 	mosquitto_free(cfg->ldap.ca_file);
 	mosquitto_free(cfg->audit.file_path);
+	mosquitto_free(cfg->audit.syslog_ident);
+	mosquitto_free(cfg->audit.syslog_facility);
 	memset(cfg, 0, sizeof(*cfg));
 }
 
@@ -250,6 +252,14 @@ static int config_defaults(struct ca_config *cfg)
 	cfg->ldap.search_cache_ttl = 60;
 
 	cfg->audit.fsync_per_line = false;
+	cfg->audit.syslog_enabled = false;
+	cfg->audit.level = AUDIT_LEVEL_INFO;
+	cfg->audit.line_cap_bytes = AUDIT_LINE_DEFAULT;
+	cfg->audit.include_chain_detail = false;
+	cfg->audit.chain_detail_max_depth = 8;
+	cfg->audit.include_san = false;
+	cfg->audit.include_custom_oids = false;
+	cfg->audit.include_eval_timing = false;
 	cfg->acl_include_payload = false;
 	return 0;
 }
@@ -297,6 +307,39 @@ static int config_parse_option(struct ca_config *cfg, const char *k, const char 
 		return config_set_str(&cfg->audit.file_path, v);
 	}else if(!strcasecmp(k, "cert_rego_audit_log_fsync")){
 		cfg->audit.fsync_per_line = parse_bool(v);
+	}else if(!strcasecmp(k, "cert_rego_audit_syslog_enabled")){
+		cfg->audit.syslog_enabled = parse_bool(v);
+	}else if(!strcasecmp(k, "cert_rego_audit_syslog_ident")){
+		return config_set_str(&cfg->audit.syslog_ident, v);
+	}else if(!strcasecmp(k, "cert_rego_audit_syslog_facility")){
+		return config_set_str(&cfg->audit.syslog_facility, v);
+	}else if(!strcasecmp(k, "cert_rego_audit_level")){
+		enum audit_level lv;
+		if(audit_log_parse_level(v, &lv)){
+			cfg->audit.level = (int)lv;
+		}else{
+			mosquitto_log_printf(MOSQ_LOG_WARNING,
+					"cert-rego: unknown audit_level '%s' (use error|warn|notice|info|debug)",
+					v);
+		}
+	}else if(!strcasecmp(k, "cert_rego_audit_line_cap")){
+		long long n = strtoll(v, NULL, 10);
+		if(n < AUDIT_LINE_MIN) n = AUDIT_LINE_MIN;
+		if(n > AUDIT_LINE_MAX) n = AUDIT_LINE_MAX;
+		cfg->audit.line_cap_bytes = (size_t)n;
+	}else if(!strcasecmp(k, "cert_rego_audit_chain_detail")){
+		cfg->audit.include_chain_detail = parse_bool(v);
+	}else if(!strcasecmp(k, "cert_rego_audit_chain_max_depth")){
+		int d = (int)strtol(v, NULL, 10);
+		if(d < 1) d = 1;
+		if(d > CA_MAX_CHAIN_ENTRIES) d = CA_MAX_CHAIN_ENTRIES;
+		cfg->audit.chain_detail_max_depth = d;
+	}else if(!strcasecmp(k, "cert_rego_audit_san")){
+		cfg->audit.include_san = parse_bool(v);
+	}else if(!strcasecmp(k, "cert_rego_audit_custom_oids")){
+		cfg->audit.include_custom_oids = parse_bool(v);
+	}else if(!strcasecmp(k, "cert_rego_audit_eval_timing")){
+		cfg->audit.include_eval_timing = parse_bool(v);
 	}else if(!strcasecmp(k, "cert_rego_acl_include_payload")){
 		cfg->acl_include_payload = parse_bool(v);
 	}else if(!strcasecmp(k, "cert_rego_ocsp_timeout_ms")){
@@ -441,6 +484,137 @@ static char *build_connect_input(struct mosquitto *client,
 		mosquitto_free(out);
 		return NULL;
 	}
+	return out;
+}
+
+
+/* Monotonic decision id, used to correlate the connect audit line with the
+ * subsequent acl lines from the same client. Wraps at 2^63; not persisted
+ * across restarts, which is fine — operators correlate per-process. */
+static uint64_t next_decision_id(void)
+{
+	static uint64_t counter = 0;
+	return __atomic_add_fetch(&counter, 1, __ATOMIC_RELAXED);
+}
+
+
+/* Microseconds since some monotonic epoch. */
+static int64_t monotonic_us(void)
+{
+#ifdef CLOCK_MONOTONIC
+	struct timespec ts;
+	if(clock_gettime(CLOCK_MONOTONIC, &ts) == 0){
+		return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+	}
+#endif
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
+
+/* Build the audit-extras body for a connect/acl decision.
+ *
+ * Always present (INFO and above): client_id, remote_addr, decision_id,
+ * core cert metadata (cn/subject/issuer/serial/fp/anchor/chain_ok/chain_errors).
+ *
+ * If `tail_extras` is non-NULL it's appended verbatim before the closing.
+ * It must already be a valid JSON-fragment (no leading or trailing comma).
+ *
+ * If level is DEBUG and the corresponding granular toggles are on,
+ * SAN / chain dump / custom OID sub-objects are appended too. eval_us is
+ * appended if include_eval_timing is true (-1 to skip).
+ *
+ * Returns a heap-allocated string (no surrounding braces) or NULL on OOM. */
+static char *build_decision_extras(struct ca_plugin *plg,
+		struct mosquitto *client,
+		uint64_t decision_id,
+		X509 *leaf,
+		STACK_OF(X509) *chain,
+		const struct ca_verify_state *vstate,
+		const char *tail_extras,
+		bool emit_debug_extras,
+		int64_t eval_us)
+{
+	const char *cid = mosquitto_client_id(client);
+	const char *addr = mosquitto_client_address(client);
+	char *cid_esc = audit_log_escape_json_string(cid ? cid : "");
+	char *addr_esc = audit_log_escape_json_string(addr ? addr : "");
+	char *core = leaf ? ca_cert_audit_core_extras(leaf, chain, vstate) : NULL;
+	char *chain_extras = NULL;
+	char *san_extras = NULL;
+	char *oid_extras = NULL;
+	char *out = NULL;
+
+	if(!cid_esc || !addr_esc) goto done;
+
+	if(emit_debug_extras && leaf){
+		if(plg->cfg.audit.include_chain_detail){
+			chain_extras = ca_cert_audit_chain_extras(chain, vstate,
+					plg->cfg.audit.chain_detail_max_depth);
+		}
+		if(plg->cfg.audit.include_san){
+			san_extras = ca_cert_audit_san_extras(leaf);
+		}
+		if(plg->cfg.audit.include_custom_oids){
+			oid_extras = ca_cert_audit_custom_oid_extras(leaf);
+		}
+	}
+
+	size_t cap = 256
+		+ strlen(cid_esc) + strlen(addr_esc)
+		+ (core ? strlen(core) + 2 : 0)
+		+ (tail_extras ? strlen(tail_extras) + 2 : 0)
+		+ (chain_extras ? strlen(chain_extras) + 2 : 0)
+		+ (san_extras ? strlen(san_extras) + 8 : 0)
+		+ (oid_extras ? strlen(oid_extras) + 2 : 0);
+	out = mosquitto_malloc(cap);
+	if(!out) goto done;
+
+	int n = snprintf(out, cap,
+			"\"client_id\":%s,\"remote_addr\":%s,\"decision_id\":%llu",
+			cid_esc, addr_esc, (unsigned long long)decision_id);
+	if(n < 0 || (size_t)n >= cap){ mosquitto_free(out); out = NULL; goto done; }
+	size_t off = (size_t)n;
+
+	if(core){
+		int m = snprintf(out + off, cap - off, ",%s", core);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+		off += (size_t)m;
+	}
+	if(tail_extras){
+		int m = snprintf(out + off, cap - off, ",%s", tail_extras);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+		off += (size_t)m;
+	}
+	if(chain_extras){
+		int m = snprintf(out + off, cap - off, ",%s", chain_extras);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+		off += (size_t)m;
+	}
+	if(san_extras){
+		int m = snprintf(out + off, cap - off, ",%s", san_extras);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+		off += (size_t)m;
+	}
+	if(oid_extras){
+		int m = snprintf(out + off, cap - off, ",%s", oid_extras);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+		off += (size_t)m;
+	}
+	if(emit_debug_extras && plg->cfg.audit.include_eval_timing && eval_us >= 0){
+		int m = snprintf(out + off, cap - off,
+				",\"eval_us\":%lld", (long long)eval_us);
+		if(m < 0 || (size_t)m >= cap - off){ mosquitto_free(out); out = NULL; goto done; }
+	}
+
+done:
+	mosquitto_free(cid_esc);
+	mosquitto_free(addr_esc);
+	mosquitto_free(core);
+	mosquitto_free(chain_extras);
+	mosquitto_free(san_extras);
+	mosquitto_free(oid_extras);
 	return out;
 }
 
@@ -591,6 +765,9 @@ static int basic_auth_callback(int event, void *event_data, void *userdata)
 
 	UNUSED(event);
 
+	uint64_t decision_id = next_decision_id();
+	int64_t t0 = monotonic_us();
+
 	leaf = (X509 *)mosquitto_client_certificate(ed->client);
 	if(leaf == NULL){
 		/* No cert on this listener — defer to other auth mechanisms. */
@@ -599,50 +776,44 @@ static int basic_auth_callback(int event, void *event_data, void *userdata)
 
 	if(!plg->rego){
 		/* Should be unreachable: plugin_init refuses to load if
-		 * rego_engine_new fails. Defence in depth if something unusual
-		 * clears plg->rego later — default-deny plus loud audit. */
+		 * rego_engine_new fails. Defence in depth — default-deny plus
+		 * loud audit (ERROR-level). */
 		mosquitto_log_printf(MOSQ_LOG_ERR,
 				"cert-rego: rego engine not initialised, denying");
-		audit_log_event(plg->audit, "connect", "deny",
-				"\"stage\":\"no_rego_engine\"");
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"connect", "deny", "\"stage\":\"no_rego_engine\"");
 		goto out;
 	}
 
 	/* Build + inspect the chain. ca_verify_chain collects per-cert
 	 * errors but does NOT abort on failure — Rego is authoritative and
-	 * may legitimately override specific failure modes (e.g. accept an
-	 * expired intermediate during a root rotation). */
+	 * may legitimately override specific failure modes. */
 	rc = ca_verify_chain(plg, leaf, &ctx, &chain, &anchor, &vstate);
 	if(rc != MOSQ_ERR_SUCCESS){
-		/* Only OOM or other catastrophic failure reaches here. A failed
-		 * verification returns SUCCESS with vstate.chain_ok == false. */
-		audit_log_event(plg->audit, "connect", "deny", "\"stage\":\"verify_error\"");
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_WARNING,
+				"connect", "deny", "\"stage\":\"verify_error\"");
 		goto out;
 	}
 	(void)anchor;  /* anchor is emitted inside ca_cert_input_json */
 
-	/* Build the input doc with all cert fields + chain + per-cert
-	 * verification results. */
 	cert_json = ca_cert_input_json(leaf, chain, &vstate);
 	if(!cert_json){
 		mosquitto_log_printf(MOSQ_LOG_ERR,
 				"cert-rego: failed to build cert input json");
-		audit_log_event(plg->audit, "connect", "deny",
-				"\"stage\":\"input_build_error\"");
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"connect", "deny", "\"stage\":\"input_build_error\"");
 		rc = MOSQ_ERR_AUTH;
 		goto out;
 	}
 
 	input_real = build_connect_input(ed->client, ed->username, cert_json);
 	if(!input_real){
-		audit_log_event(plg->audit, "connect", "deny",
-				"\"stage\":\"input_build_error\"");
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"connect", "deny", "\"stage\":\"input_build_error\"");
 		rc = MOSQ_ERR_AUTH;
 		goto out;
 	}
 
-	/* Step 5: Rego policy. Pass the chain so ocsp.check() can find it.
-	 * Fail closed on error. */
 	if(rego_engine_eval_bool_with_chain(plg->rego,
 			plg->cfg.rego.connect_entrypoint,
 			input_real, chain, &allow) != 0){
@@ -651,13 +822,26 @@ static int basic_auth_callback(int event, void *event_data, void *userdata)
 		allow = false;
 	}
 
+	{
+		enum audit_level lv = allow ? AUDIT_LEVEL_INFO : AUDIT_LEVEL_NOTICE;
+		const char *res = allow ? "allow" : "deny";
+		bool emit = audit_log_enabled(plg->audit, lv);
+		if(emit){
+			bool debug = audit_log_enabled(plg->audit, AUDIT_LEVEL_DEBUG);
+			int64_t eval_us = debug ? (monotonic_us() - t0) : -1;
+			char *extras = build_decision_extras(plg, ed->client,
+					decision_id, leaf, chain, &vstate,
+					allow ? NULL : "\"stage\":\"rego\"",
+					debug, eval_us);
+			audit_log_event_at(plg->audit, lv, "connect", res, extras);
+			mosquitto_free(extras);
+		}
+	}
+
 	if(!allow){
-		audit_log_event(plg->audit, "connect", "deny", "\"stage\":\"rego\"");
 		rc = MOSQ_ERR_AUTH;
 		goto out;
 	}
-
-	audit_log_event(plg->audit, "connect", "allow", NULL);
 	rc = MOSQ_ERR_SUCCESS;
 
 out:
@@ -689,11 +873,12 @@ static int acl_check_callback(int event, void *event_data, void *userdata)
 
 	UNUSED(event);
 
+	uint64_t decision_id = next_decision_id();
+	int64_t t0 = monotonic_us();
+
 	if(!plg->rego){
-		/* Same defence-in-depth posture as basic_auth. Should be
-		 * unreachable; still default-deny with an audit event. */
-		audit_log_event(plg->audit, "acl", "deny",
-				"\"stage\":\"no_rego_engine\"");
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"acl", "deny", "\"stage\":\"no_rego_engine\"");
 		return MOSQ_ERR_ACL_DENIED;
 	}
 
@@ -703,10 +888,10 @@ static int acl_check_callback(int event, void *event_data, void *userdata)
 	}
 
 	/* Re-verify the chain for each ACL check, collecting the same per-cert
-	 * verification state as CONNECT. Rego ACL policies see the chain plus
-	 * chain_ok / chain_errors so they can apply the same override logic
-	 * as the connect rule. */
+	 * verification state as CONNECT. */
 	if(ca_verify_chain(plg, leaf, &ctx, &chain, &anchor, &vstate) != MOSQ_ERR_SUCCESS){
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_WARNING,
+				"acl", "deny", "\"stage\":\"verify_error\"");
 		rc = MOSQ_ERR_ACL_DENIED;
 		goto out;
 	}
@@ -714,6 +899,8 @@ static int acl_check_callback(int event, void *event_data, void *userdata)
 
 	cert_json = ca_cert_input_json(leaf, chain, &vstate);
 	if(!cert_json){
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"acl", "deny", "\"stage\":\"input_build_error\"");
 		goto out;
 	}
 
@@ -723,6 +910,8 @@ static int acl_check_callback(int event, void *event_data, void *userdata)
 			(uint8_t)ed->qos, ed->retain,
 			plg->cfg.acl_include_payload);
 	if(!input_real){
+		audit_log_event_at(plg->audit, AUDIT_LEVEL_ERROR,
+				"acl", "deny", "\"stage\":\"input_build_error\"");
 		goto out;
 	}
 
@@ -732,14 +921,26 @@ static int acl_check_callback(int event, void *event_data, void *userdata)
 	}
 
 	{
-		char extras[512];
-		char *topic_esc = audit_log_escape_json_string(ed->topic ? ed->topic : "");
-		if(topic_esc){
-			snprintf(extras, sizeof(extras),
-					"\"action\":\"%s\",\"topic\":%s,\"qos\":%u",
-					acl_action_string(ed->access), topic_esc, (unsigned)ed->qos);
-			audit_log_event(plg->audit, "acl", allow ? "allow" : "deny", extras);
-			mosquitto_free(topic_esc);
+		enum audit_level lv = allow ? AUDIT_LEVEL_INFO : AUDIT_LEVEL_NOTICE;
+		const char *res = allow ? "allow" : "deny";
+		if(audit_log_enabled(plg->audit, lv)){
+			bool debug = audit_log_enabled(plg->audit, AUDIT_LEVEL_DEBUG);
+			int64_t eval_us = debug ? (monotonic_us() - t0) : -1;
+			char *topic_esc = audit_log_escape_json_string(
+					ed->topic ? ed->topic : "");
+			char tail[512];
+			if(topic_esc){
+				snprintf(tail, sizeof(tail),
+						"\"action\":\"%s\",\"topic\":%s,\"qos\":%u",
+						acl_action_string(ed->access), topic_esc,
+						(unsigned)ed->qos);
+				char *extras = build_decision_extras(plg, ed->client,
+						decision_id, leaf, chain, &vstate,
+						tail, debug, eval_us);
+				audit_log_event_at(plg->audit, lv, "acl", res, extras);
+				mosquitto_free(extras);
+				mosquitto_free(topic_esc);
+			}
 		}
 	}
 
@@ -791,7 +992,18 @@ static int reload_callback(int event, void *event_data, void *userdata)
 		return MOSQ_ERR_SUCCESS;
 	}
 
-	new_audit = audit_log_open(new_cfg.audit.file_path, new_cfg.audit.fsync_per_line);
+	{
+		struct audit_log_config alc = {
+			.file_path       = new_cfg.audit.file_path,
+			.fsync_per_line  = new_cfg.audit.fsync_per_line,
+			.syslog_enabled  = new_cfg.audit.syslog_enabled,
+			.syslog_ident    = new_cfg.audit.syslog_ident,
+			.syslog_facility = new_cfg.audit.syslog_facility,
+			.level           = (enum audit_level)new_cfg.audit.level,
+			.line_cap_bytes  = new_cfg.audit.line_cap_bytes,
+		};
+		new_audit = audit_log_open(&alc);
+	}
 
 	/* AIA / CRL caches: create if the new config enables the feature and
 	 * we don't already have one; drop if disabled. Keep across reloads
@@ -822,7 +1034,8 @@ static int reload_callback(int event, void *event_data, void *userdata)
 	plg->aia_cache = new_aia;
 	plg->crl_cache = new_crl;
 
-	audit_log_event(plg->audit, "plugin.reload", "ok", NULL);
+	audit_log_event_at(plg->audit, AUDIT_LEVEL_NOTICE,
+			"plugin.reload", "ok", NULL);
 	return MOSQ_ERR_SUCCESS;
 }
 
@@ -882,8 +1095,18 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **user_data,
 		}
 	}
 
-	plg_state.audit = audit_log_open(plg_state.cfg.audit.file_path,
-			plg_state.cfg.audit.fsync_per_line);
+	{
+		struct audit_log_config alc = {
+			.file_path       = plg_state.cfg.audit.file_path,
+			.fsync_per_line  = plg_state.cfg.audit.fsync_per_line,
+			.syslog_enabled  = plg_state.cfg.audit.syslog_enabled,
+			.syslog_ident    = plg_state.cfg.audit.syslog_ident,
+			.syslog_facility = plg_state.cfg.audit.syslog_facility,
+			.level           = (enum audit_level)plg_state.cfg.audit.level,
+			.line_cap_bytes  = plg_state.cfg.audit.line_cap_bytes,
+		};
+		plg_state.audit = audit_log_open(&alc);
+	}
 
 	plg_state.rego = rego_engine_new(&plg_state, plg_state.cfg.rego.policy_file);
 	if(!plg_state.rego){
@@ -927,7 +1150,8 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **user_data,
 			plg_state.cfg.ca_file_count + (plg_state.cfg.ca_path ? 1 : 0),
 			plg_state.cfg.ldap.allowed_url_count,
 			plg_state.cfg.audit.file_path ? plg_state.cfg.audit.file_path : "(none)");
-	audit_log_event(plg_state.audit, "plugin.init", "ok", NULL);
+	audit_log_event_at(plg_state.audit, AUDIT_LEVEL_NOTICE,
+			"plugin.init", "ok", NULL);
 	return MOSQ_ERR_SUCCESS;
 
 init_fail:
@@ -961,7 +1185,8 @@ int mosquitto_plugin_cleanup(void *user_data,
 	UNUSED(options);
 	UNUSED(option_count);
 
-	audit_log_event(plg_state.audit, "plugin.shutdown", "ok", NULL);
+	audit_log_event_at(plg_state.audit, AUDIT_LEVEL_NOTICE,
+			"plugin.shutdown", "ok", NULL);
 
 	if(plg_state.rego){
 		rego_engine_drop(plg_state.rego);

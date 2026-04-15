@@ -1049,3 +1049,225 @@ oom:
 	mosquitto_free(b.data);
 	return NULL;
 }
+
+
+/* ===========================================================================
+ * Audit-extras builders. Produce JSON object bodies (no surrounding braces)
+ * for audit_log_event_at(extras_json=...). All strings truncated.
+ * ========================================================================= */
+
+/* Truncating variant of jb_append_jstr — caps at AUDIT_DN_MAX_CHARS chars. */
+static bool jb_append_jstr_trunc(struct json_buf *b, const char *s)
+{
+	char *esc = audit_log_escape_json_string_truncated(s ? s : "",
+			AUDIT_DN_MAX_CHARS);
+	if(!esc) return false;
+	bool ok = jb_append(b, esc);
+	mosquitto_free(esc);
+	return ok;
+}
+
+
+/* Same as append_name_as_json_string but truncates the rendered DN. */
+static bool jb_append_name_trunc(struct json_buf *b, X509_NAME *name)
+{
+	if(!name) return jb_append(b, "\"\"");
+	BIO *mem = BIO_new(BIO_s_mem());
+	if(!mem) return false;
+	if(X509_NAME_print_ex(mem, name, 0,
+			XN_FLAG_RFC2253 & ~ASN1_STRFLGS_ESC_MSB) <= 0){
+		BIO_free(mem);
+		return jb_append(b, "\"\"");
+	}
+	BUF_MEM *bp = NULL;
+	BIO_get_mem_ptr(mem, &bp);
+	char *tmp = NULL;
+	if(bp && bp->length > 0){
+		tmp = mosquitto_calloc(1, bp->length + 1);
+		if(tmp) memcpy(tmp, bp->data, bp->length);
+	}
+	BIO_free(mem);
+	if(!tmp){
+		return jb_append(b, "\"\"");
+	}
+	bool ok = jb_append_jstr_trunc(b, tmp);
+	mosquitto_free(tmp);
+	return ok;
+}
+
+
+char *ca_cert_audit_core_extras(X509 *leaf,
+		STACK_OF(X509) *chain,
+		const struct ca_verify_state *state)
+{
+	if(!leaf) return NULL;
+
+	struct json_buf b = {0};
+	char *cn = NULL;
+	char *fp = NULL;
+	char *serial = NULL;
+	char *anchor_fp = NULL;
+
+	cn = extract_cn(leaf);
+	if(!jb_append(&b, "\"cn\":")) goto oom;
+	if(!jb_append_jstr_trunc(&b, cn ? cn : "")) goto oom;
+
+	if(!jb_append(&b, ",\"subject_dn\":")) goto oom;
+	if(!jb_append_name_trunc(&b, X509_get_subject_name(leaf))) goto oom;
+
+	if(!jb_append(&b, ",\"issuer_dn\":")) goto oom;
+	if(!jb_append_name_trunc(&b, X509_get_issuer_name(leaf))) goto oom;
+
+	serial = cert_serial_hex(leaf);
+	if(!jb_append(&b, ",\"serial\":")) goto oom;
+	if(!jb_append_jstr(&b, serial ? serial : "")) goto oom;
+
+	fp = cert_fingerprint_sha256_hex(leaf);
+	if(!jb_append(&b, ",\"fingerprint_sha256\":")) goto oom;
+	if(!jb_append_jstr(&b, fp ? fp : "")) goto oom;
+
+	if(!jb_append(&b, ",\"trust_anchor_fp\":")) goto oom;
+	int chain_n = chain ? sk_X509_num(chain) : 0;
+	if(state && state->chain_ok && chain_n > 0){
+		anchor_fp = cert_fingerprint_sha256_hex(sk_X509_value(chain, chain_n - 1));
+		if(!jb_append_jstr(&b, anchor_fp ? anchor_fp : "")) goto oom;
+	}else{
+		if(!jb_append(&b, "null")) goto oom;
+	}
+
+	if(!jb_append(&b, ",\"chain_ok\":")) goto oom;
+	if(!jb_append(&b, (state && state->chain_ok) ? "true" : "false")) goto oom;
+
+	if(!jb_append(&b, ",\"chain_errors\":[")) goto oom;
+	if(state){
+		for(int i = 0; i < state->distinct_count; i++){
+			if(i > 0){ if(!jb_append(&b, ",")) goto oom; }
+			if(!jb_append_jstr(&b, state->distinct_codes[i] ?
+					state->distinct_codes[i] : "other")) goto oom;
+		}
+	}
+	if(!jb_append(&b, "]")) goto oom;
+
+	mosquitto_free(cn);
+	mosquitto_free(fp);
+	mosquitto_free(serial);
+	mosquitto_free(anchor_fp);
+	return b.data;
+
+oom:
+	mosquitto_free(cn);
+	mosquitto_free(fp);
+	mosquitto_free(serial);
+	mosquitto_free(anchor_fp);
+	mosquitto_free(b.data);
+	return NULL;
+}
+
+
+/* Per-cert chain entry for audit. Smaller than the policy-input entry —
+ * errors[] are emitted as bare short codes (no message), DNs truncated. */
+static bool append_audit_chain_entry(struct json_buf *b, X509 *cert, int depth,
+		const struct ca_verify_state *state)
+{
+	char depth_buf[64];
+	snprintf(depth_buf, sizeof(depth_buf), "{\"depth\":%d,\"subject_dn\":", depth);
+	if(!jb_append(b, depth_buf)) return false;
+	if(!jb_append_name_trunc(b, X509_get_subject_name(cert))) return false;
+
+	if(!jb_append(b, ",\"issuer_dn\":")) return false;
+	if(!jb_append_name_trunc(b, X509_get_issuer_name(cert))) return false;
+
+	char *serial = cert_serial_hex(cert);
+	if(!jb_append(b, ",\"serial\":")) { mosquitto_free(serial); return false; }
+	bool ok = jb_append_jstr(b, serial ? serial : "");
+	mosquitto_free(serial);
+	if(!ok) return false;
+
+	char *fp = cert_fingerprint_sha256_hex(cert);
+	if(!jb_append(b, ",\"fingerprint_sha256\":")) { mosquitto_free(fp); return false; }
+	ok = jb_append_jstr(b, fp ? fp : "");
+	mosquitto_free(fp);
+	if(!ok) return false;
+
+	if(!jb_append(b, ",\"not_before_unix\":")) return false;
+	if(!jb_append_int64(b, asn1_time_to_unix(X509_get0_notBefore(cert)))) return false;
+	if(!jb_append(b, ",\"not_after_unix\":")) return false;
+	if(!jb_append_int64(b, asn1_time_to_unix(X509_get0_notAfter(cert)))) return false;
+
+	bool verify_ok = true;
+	const struct ca_verify_cert_result *vr = NULL;
+	if(state && depth >= 0 && depth < state->cert_count){
+		vr = &state->per_cert[depth];
+		verify_ok = vr->verify_ok;
+	}
+	if(!jb_append(b, ",\"verify_ok\":")) return false;
+	if(!jb_append(b, verify_ok ? "true" : "false")) return false;
+
+	if(!jb_append(b, ",\"errors\":[")) return false;
+	if(vr){
+		for(int i = 0; i < vr->error_count; i++){
+			if(i > 0){ if(!jb_append(b, ",")) return false; }
+			if(!jb_append_jstr(b, vr->short_codes[i] ?
+					vr->short_codes[i] : "other")) return false;
+		}
+	}
+	if(!jb_append(b, "]")) return false;
+
+	return jb_append(b, "}");
+}
+
+
+char *ca_cert_audit_chain_extras(STACK_OF(X509) *chain,
+		const struct ca_verify_state *state,
+		int max_depth)
+{
+	if(max_depth <= 0) max_depth = 8;
+
+	struct json_buf b = {0};
+	if(!jb_append(&b, "\"chain\":[")) goto oom;
+
+	int total = chain ? sk_X509_num(chain) : 0;
+	int emit = total < max_depth ? total : max_depth;
+
+	for(int i = 0; i < emit; i++){
+		X509 *c = sk_X509_value(chain, i);
+		if(!c) continue;
+		if(i > 0){ if(!jb_append(&b, ",")) goto oom; }
+		if(!append_audit_chain_entry(&b, c, i, state)) goto oom;
+	}
+	if(!jb_append(&b, "]")) goto oom;
+
+	if(total > emit){
+		if(!jb_append(&b, ",\"chain_truncated\":true")) goto oom;
+	}
+	return b.data;
+
+oom:
+	mosquitto_free(b.data);
+	return NULL;
+}
+
+
+char *ca_cert_audit_san_extras(X509 *leaf)
+{
+	if(!leaf) return NULL;
+	struct json_buf b = {0};
+	if(!append_san_arrays(&b, leaf)) goto oom;
+	return b.data;
+oom:
+	mosquitto_free(b.data);
+	return NULL;
+}
+
+
+char *ca_cert_audit_custom_oid_extras(X509 *leaf)
+{
+	if(!leaf) return NULL;
+	struct json_buf b = {0};
+	if(!jb_append(&b, "\"custom_extensions\":")) goto oom;
+	if(!append_custom_extensions(&b, leaf)) goto oom;
+	return b.data;
+oom:
+	mosquitto_free(b.data);
+	return NULL;
+}

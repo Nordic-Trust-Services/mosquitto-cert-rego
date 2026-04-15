@@ -138,6 +138,16 @@ See [`test.conf`](test.conf) for an annotated example. Plugin options are all `p
 | `cert_rego_ldap_cache_ttl` | `60` | Seconds to cache `ldap.search`/`exists`/`is_member`. `0` disables |
 | `cert_rego_audit_log_file` | unset (disabled) | Path to JSON-lines audit log |
 | `cert_rego_audit_log_fsync` | `false` | `fsync` on every line. Durable, slow |
+| `cert_rego_audit_syslog_enabled` | `false` | Mirror every audit line to syslog (in addition to / instead of file) |
+| `cert_rego_audit_syslog_ident` | `mosquitto-cert-rego` | Syslog program tag (`openlog(3)` ident) |
+| `cert_rego_audit_syslog_facility` | `authpriv` | One of `auth`, `authpriv`, `daemon`, `user`, `local0..local7` |
+| `cert_rego_audit_level` | `info` | Threshold filter: `error`, `warn`, `notice`, `info`, `debug` |
+| `cert_rego_audit_line_cap` | `4096` | Hard per-line byte cap; over-long lines get rebuilt with `"truncated":true` (clamp 1024..16384) |
+| `cert_rego_audit_chain_detail` | `false` | DEBUG: include the per-cert chain dump |
+| `cert_rego_audit_chain_max_depth` | `8` | DEBUG: truncate chain dump to N entries |
+| `cert_rego_audit_san` | `false` | DEBUG: include SAN sub-object |
+| `cert_rego_audit_custom_oids` | `false` | DEBUG: include custom-extensions sub-object |
+| `cert_rego_audit_eval_timing` | `false` | DEBUG: add `eval_us` per decision |
 | `cert_rego_acl_include_payload` | `false` | Include publish payload in ACL input as `input.acl.payload_b64` (hot path) |
 | `cert_rego_ocsp_timeout_ms` | `3000` | Per-request OCSP deadline when a policy calls `ocsp.check()` |
 | `cert_rego_ocsp_min_refresh` | `86400` | Cache floor: don't re-query OCSP for the same cert more often than this |
@@ -286,6 +296,12 @@ ldap.is_member(url, bind_dn, bind_pw, group_dn, user_dn)  ->  bool
 # The policy decides what statuses constitute "allow" — see example 05.
 ocsp.check()  ->  string
 
+# Attach a free-form note to the audit trail. Emitted as a `policy.note`
+# event at DEBUG level, so it stays out of the way until the operator opts
+# in. Always returns true so it composes inside rule bodies. Pass
+# json.marshal(obj) for structured payloads.
+audit.log(message)  ->  bool
+
 # CRL check — same shape as ocsp.check() but against CRLs fetched from
 # the cert's crlDistributionPoints extension. Every fetched CRL is
 # cached by URL so repeated connects don't re-download; the cache is
@@ -358,17 +374,55 @@ Specific situations:
 
 ## Logging
 
-Two independent streams:
+Two channels:
 
 1. **Broker log** via `mosquitto_log_printf` — operational events at `NOTICE`/`INFO`/`DEBUG`, never credentials.
-2. **Audit log** — JSON lines, one per event, at `cert_rego_audit_log_file`. Contains:
-   - `plugin.init`, `plugin.reload`, `plugin.shutdown`
-   - `connect` allow/deny (`stage` field distinguishes `verify_error` and `rego` denials; chain-verify failures are no longer a stage on their own — they feed into Rego and surface as `rego` denials if the policy chose to reject)
-   - `acl` allow/deny with topic and action
-   - `ldap` events per host-function call with url, result code, entry count, and cache hit/miss
-   - `ocsp.query` (when enabled)
+2. **Audit log** — structured JSON, one event per line. Two sinks (file and syslog) speak the same line format; either or both can be enabled. A single level filter applies to both, so file and syslog stay in sync.
 
-The audit log is append-only; use `logrotate` with `copytruncate` for rotation.
+Each line carries `ts`, `level`, `event`, optional `result`, plus event-specific extras. Example INFO-level allow line under a relaxed policy:
+
+```json
+{"ts":"2026-04-15T07:30:01.123Z","level":"info","event":"connect","result":"allow",
+ "client_id":"sensor-12","remote_addr":"10.0.0.42","decision_id":4711,
+ "cn":"sensor-12","subject_dn":"CN=sensor-12,O=acme,C=US",
+ "issuer_dn":"CN=Acme Device Intermediate,O=acme,C=US",
+ "serial":"1a2b3c","fingerprint_sha256":"abc...",
+ "trust_anchor_fp":"def...","chain_ok":true,"chain_errors":[]}
+```
+
+### Levels
+
+| Level | What's emitted |
+|---|---|
+| `error` | internal plugin failures (no rego engine, JSON build OOM) |
+| `warn` | + chain build / verify_error denies, sink-write failures |
+| `notice` | + plugin lifecycle (`plugin.init/reload/shutdown`) and **deny decisions** (production deny-only sink) |
+| `info` (default) | + **allow decisions** with full cert metadata. Visible-by-default for relaxed policies. |
+| `debug` | + per-cert chain dump (truncated), SAN, custom OIDs, `eval_us` per decision, `policy.note` events injected by Rego's `audit.log()` |
+
+### Truncation
+
+Every line is bounded by `cert_rego_audit_line_cap` (default 4096 bytes; 1024..16384). DNs in the chain dump are individually truncated to 256 chars (UTF-8 ellipsis `\u2026` appended). The chain dump itself is capped at `cert_rego_audit_chain_max_depth` entries (default 8); deeper chains get a `"chain_truncated":true` marker. If the assembled line still exceeds the cap, the extras are dropped and the line is reissued as the minimal `{"ts":...,"level":...,"event":...,"result":...,"truncated":true}` form.
+
+### Syslog
+
+When `cert_rego_audit_syslog_enabled true` the same JSON line is forwarded via `syslog(3)` at the corresponding priority (`error`→`LOG_ERR`, `warn`→`LOG_WARNING`, `notice`→`LOG_NOTICE`, `info`→`LOG_INFO`, `debug`→`LOG_DEBUG`). Default ident is `mosquitto-cert-rego`, default facility is `authpriv` — picked up by rsyslog/journald and parseable as JSON by every modern SIEM.
+
+### Policy-side audit
+
+A Rego policy can attach a free-form note to the audit trail with the `audit.log(message)` host function:
+
+```rego
+allow {
+    input.cert.cn != ""
+    chain_ok_or_tolerable_expiry
+    audit.log(sprintf("override:expired_intermediate cn=%s", [input.cert.cn]))
+}
+```
+
+The note is emitted as a `policy.note` event at DEBUG level — invisible at the default INFO threshold but available when chasing why a particular decision went the way it did. `audit.log` always returns `true` so it composes inside rule bodies; passing `json.marshal(obj)` lets policies attach structured payloads.
+
+The file sink is append-only; use `logrotate` with `copytruncate` for rotation.
 
 ## Limitations
 

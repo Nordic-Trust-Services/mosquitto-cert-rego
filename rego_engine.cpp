@@ -80,6 +80,22 @@ static struct ca_plugin *g_plugin = nullptr;
 static STACK_OF(X509) *g_current_chain = nullptr;
 
 
+/* Returns true iff the node from add_module_file / set_input_json /
+ * add_data_json should be treated as a failure. rego-cpp signals parse
+ * failure two ways: the node's type is Error, or the node is an ErrorSeq
+ * (collection of errors) that carries one or more Error children
+ * somewhere in the tree. Checking only `type() == Error` misses the
+ * ErrorSeq case, which is the common one for syntax errors. */
+static bool node_is_error(const Node& n)
+{
+	if(!n) return false;
+	if(n->type() == Error) return true;
+	rego::Nodes errors;
+	n->get_errors(errors);
+	return !errors.empty();
+}
+
+
 /* Extract a single string argument by index. On any failure returns the
  * error Node unwrap_arg produced; callers propagate it up as the builtin's
  * return value so rego-cpp reports a well-shaped builtin error. */
@@ -466,7 +482,7 @@ extern "C" struct rego_engine *rego_engine_new(
 		e->interp = std::make_unique<Interpreter>();
 		register_host_builtins(*e->interp);
 		Node result = e->interp->add_module_file(policy_file);
-		if(result && result->type() == Error){
+		if(node_is_error(result)){
 			mosquitto_log_printf(MOSQ_LOG_ERR,
 					"cert-rego: failed to load rego policy %s: %s",
 					policy_file, rego::to_key(result).c_str());
@@ -500,7 +516,7 @@ extern "C" int rego_engine_reload(struct rego_engine *e, const char *policy_file
 		auto fresh = std::make_unique<Interpreter>();
 		register_host_builtins(*fresh);
 		Node result = fresh->add_module_file(policy_file);
-		if(result && result->type() == Error){
+		if(node_is_error(result)){
 			mosquitto_log_printf(MOSQ_LOG_ERR,
 					"cert-rego: policy reload failed, keeping previous policy: %s",
 					rego::to_key(result).c_str());

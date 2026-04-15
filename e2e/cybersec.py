@@ -21,9 +21,12 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import random
+import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 E2E_DIR = pathlib.Path(__file__).resolve().parent
@@ -323,6 +326,179 @@ def t_policy_note() -> None:
 # reload safety
 # --------------------------------------------------------------------------
 
+@test("reload_race_under_load_atomic_swap")
+def t_reload_race() -> None:
+    """Stress the SIGHUP reload path while client threads hammer the broker
+    with connect+publish. The plugin's reload is supposed to build the new
+    policy + trust store in full, then atomically swap; a torn swap would
+    surface as a malformed audit line, a missing core field, a duplicated
+    decision_id, or the broker dying mid-race.
+
+    Two valid policies are rotated under e2e/run/policy.rego. Both are
+    permissive for the two operator cert patterns but differ by an
+    audit.log tag so we can see both observed during the run. Test
+    duration: ~3 s with 4 client threads and SIGHUPs every 150 ms."""
+    current_policy = RUN / "policy.rego"
+    original = current_policy.read_text()
+
+    # Minimal stand-in policies — both allow the test clients, differ by
+    # the audit tag. Fingerprints come from the on-disk roots.
+    def policy_with_tag(tag: str) -> str:
+        fp_a = subprocess.check_output(
+            ["openssl", "x509", "-in", str(PKI/"root_a.crt"),
+             "-noout", "-fingerprint", "-sha256"],
+            text=True,
+        ).strip().split("=", 1)[1].replace(":", "").lower()
+        fp_b = subprocess.check_output(
+            ["openssl", "x509", "-in", str(PKI/"root_b.crt"),
+             "-noout", "-fingerprint", "-sha256"],
+            text=True,
+        ).strip().split("=", 1)[1].replace(":", "").lower()
+        return textwrap.dedent(f"""\
+            package mqtt
+
+            root_a_fp := "{fp_a}"
+            root_b_fp := "{fp_b}"
+
+            anchor_fp := input.cert.trust_anchor.fingerprint_sha256
+            is_operator {{ anchor_fp == root_a_fp }}
+            is_device   {{ anchor_fp == root_b_fp }}
+
+            default connect := false
+            default acl := false
+
+            connect {{
+                input.cert.chain_ok
+                input.cert.cn != ""
+                is_operator
+                audit.log("policy={tag} role=operator")
+            }}
+            connect {{
+                input.cert.chain_ok
+                input.cert.cn != ""
+                is_device
+                audit.log("policy={tag} role=device")
+            }}
+
+            acl {{ is_operator; startswith(input.acl.topic, "devices/") }}
+            acl {{ is_device; startswith(input.acl.topic, sprintf("devices/%s/", [input.cert.cn])) }}
+        """)
+
+    pol_a = policy_with_tag("A")
+    pol_b = policy_with_tag("B")
+
+    pid = int((RUN / "broker.pid").read_text().strip())
+    reset_audit()
+    current_policy.write_text(pol_a)
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.1)
+
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def worker(cert: str, key: str, cn: str, topic_pattern: str):
+        while not stop.is_set():
+            try:
+                do_publish(cert, key, cn, topic_pattern.format(n=random.randint(1, 1000)),
+                           msg="x", qos=0,
+                           extra=["--quiet"])
+            except Exception as e:
+                errors.append(f"{cn}: {e}")
+
+    threads = [
+        threading.Thread(target=worker,
+                         args=("operator_alice.crt", "operator_alice.key",
+                               "alice", "devices/a/{n}"),
+                         daemon=True),
+        threading.Thread(target=worker,
+                         args=("operator_bob.crt", "operator_bob.key",
+                               "bob", "devices/b/{n}"),
+                         daemon=True),
+        threading.Thread(target=worker,
+                         args=("device_01.crt", "device_01.key",
+                               "device-01", "devices/device-01/{n}"),
+                         daemon=True),
+        threading.Thread(target=worker,
+                         args=("device_02.crt", "device_02.key",
+                               "device-02", "devices/device-02/{n}"),
+                         daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    # Flap the policy file and SIGHUP every ~150ms for ~3 seconds.
+    start = time.monotonic()
+    i = 0
+    while time.monotonic() - start < 3.0:
+        current_policy.write_text(pol_a if i % 2 == 0 else pol_b)
+        try:
+            os.kill(pid, signal.SIGHUP)
+        except OSError as e:
+            stop.set()
+            raise TestFailure(f"broker died mid-reload: {e}")
+        time.sleep(0.15)
+        i += 1
+
+    stop.set()
+    for t in threads:
+        t.join(timeout=3)
+
+    # Broker must still be alive.
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        raise TestFailure("broker died during reload race")
+
+    # Restore original policy for subsequent tests.
+    current_policy.write_text(original)
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.2)
+
+    if errors:
+        # Client thread errors are allowed (connects can race TLS shutdown);
+        # what matters is broker state. Log a summary only.
+        print(f"    ({len(errors)} worker transient errors, OK to ignore)")
+
+    lines = read_audit()  # raises if any line is malformed JSON
+    if not lines:
+        raise TestFailure("no audit lines produced during race")
+
+    # 1. every decision line has the core cert fields.
+    decisions = [l for l in lines if l.get("event") in {"connect", "acl"}]
+    for d in decisions:
+        for field in ("cn", "chain_ok", "decision_id", "client_id"):
+            if field not in d:
+                raise TestFailure(
+                    f"decision line missing {field}: {d}"
+                )
+
+    # 2. decision_ids are unique across the whole run.
+    ids = [d["decision_id"] for d in decisions if d.get("decision_id") is not None]
+    if len(set(ids)) != len(ids):
+        dups = [x for x in set(ids) if ids.count(x) > 1]
+        raise TestFailure(f"duplicate decision_id under race: {dups[:5]}")
+
+    # 3. both policy tags (A and B) were observed — proves both policies
+    #    actually served decisions during the race, so the atomic-swap
+    #    claim is meaningful (not just one policy holding the whole run).
+    notes = [l.get("note", "") for l in lines if l.get("event") == "policy.note"]
+    saw_a = any("policy=A" in n for n in notes)
+    saw_b = any("policy=B" in n for n in notes)
+    if not (saw_a and saw_b):
+        raise TestFailure(
+            f"expected both A and B tags in policy.note during race, "
+            f"got A={saw_a} B={saw_b} ({len(notes)} notes total)"
+        )
+
+    # 4. a clean connect after the race still works.
+    cp = do_publish("operator_alice.crt", "operator_alice.key", "alice",
+                    "devices/alice/post-race", "x")
+    if cp.returncode != 0:
+        raise TestFailure(
+            f"post-race connect failed: {cp.stdout!r} / {cp.stderr!r}"
+        )
+
+
 @test("reload_broken_policy_keeps_previous")
 def t_reload_broken() -> None:
     """SIGHUP the broker with a syntactically broken policy. The broker must
@@ -337,8 +513,12 @@ def t_reload_broken() -> None:
     original = current_policy.read_text()
     backup_policy.write_text(original)
     try:
-        # Write syntactically broken Rego.
-        current_policy.write_text("package mqtt\n\nthis is not valid rego\n")
+        # A numeric package name is a hard parse error in rego — much
+        # more likely to trip rego-cpp's parser than freeform gibberish.
+        # (rego-cpp is surprisingly lenient about stray tokens at the
+        # top level; we want the reload to definitively fail so we can
+        # assert the fail-safe path.)
+        current_policy.write_text("package 123\n")
         reset_audit()
 
         pid = int((RUN / "broker.pid").read_text().strip())

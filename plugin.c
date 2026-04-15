@@ -972,10 +972,78 @@ static int reload_callback(int event, void *event_data, void *userdata)
 
 	mosquitto_log_printf(MOSQ_LOG_INFO, "cert-rego: reload requested");
 
-	if(config_load(&new_cfg, ed->options, ed->option_count) != 0){
-		mosquitto_log_printf(MOSQ_LOG_ERR,
-				"cert-rego: reload: config load failed, keeping previous");
-		return MOSQ_ERR_SUCCESS;
+	/* Mosquitto 2.1's MOSQ_EVT_RELOAD event arrives with an empty
+	 * options array — plugin options are not re-delivered. Re-parse only
+	 * when the event carries options (future-proofing for brokers that
+	 * fix this); otherwise keep using the stashed cfg and just refresh
+	 * the on-disk policy + trust store. */
+	if(ed->option_count > 0){
+		if(config_load(&new_cfg, ed->options, ed->option_count) != 0){
+			mosquitto_log_printf(MOSQ_LOG_ERR,
+					"cert-rego: reload: config load failed, keeping previous");
+			return MOSQ_ERR_SUCCESS;
+		}
+	}else{
+		/* No options in event — clone current cfg so downstream reload
+		 * machinery still has a struct to operate on. config_free at the
+		 * end of success path will clean it up. */
+		memset(&new_cfg, 0, sizeof(new_cfg));
+		if(config_defaults(&new_cfg) != 0){
+			return MOSQ_ERR_SUCCESS;
+		}
+		/* Copy over the scalar + string fields from the live cfg. */
+#define CFG_COPY_STR(FIELD) do { \
+	mosquitto_free(new_cfg.FIELD); \
+	new_cfg.FIELD = plg->cfg.FIELD ? mosquitto_strdup(plg->cfg.FIELD) : NULL; \
+} while(0)
+		CFG_COPY_STR(ca_path);
+		CFG_COPY_STR(rego.policy_file);
+		mosquitto_free(new_cfg.rego.connect_entrypoint);
+		new_cfg.rego.connect_entrypoint = mosquitto_strdup(plg->cfg.rego.connect_entrypoint);
+		mosquitto_free(new_cfg.rego.acl_entrypoint);
+		new_cfg.rego.acl_entrypoint = mosquitto_strdup(plg->cfg.rego.acl_entrypoint);
+		CFG_COPY_STR(ldap.ca_file);
+		CFG_COPY_STR(audit.file_path);
+		CFG_COPY_STR(audit.syslog_ident);
+		CFG_COPY_STR(audit.syslog_facility);
+#undef CFG_COPY_STR
+		/* CSV ca_files. */
+		new_cfg.ca_file_count = plg->cfg.ca_file_count;
+		if(new_cfg.ca_file_count){
+			new_cfg.ca_files = mosquitto_calloc(new_cfg.ca_file_count + 1, sizeof(char *));
+			if(new_cfg.ca_files){
+				for(size_t i = 0; i < new_cfg.ca_file_count; i++){
+					new_cfg.ca_files[i] = mosquitto_strdup(plg->cfg.ca_files[i]);
+				}
+			}
+		}
+		/* Scalars. */
+		new_cfg.ocsp_timeout_ms = plg->cfg.ocsp_timeout_ms;
+		new_cfg.ocsp_min_refresh_seconds = plg->cfg.ocsp_min_refresh_seconds;
+		new_cfg.ocsp_require_signing_eku = plg->cfg.ocsp_require_signing_eku;
+		new_cfg.aia_fetch_enabled = plg->cfg.aia_fetch_enabled;
+		new_cfg.aia_fetch_timeout_ms = plg->cfg.aia_fetch_timeout_ms;
+		new_cfg.aia_fetch_max_depth = plg->cfg.aia_fetch_max_depth;
+		new_cfg.aia_fetch_max_size = plg->cfg.aia_fetch_max_size;
+		new_cfg.aia_fetch_cache_ttl = plg->cfg.aia_fetch_cache_ttl;
+		new_cfg.crl_fetch_enabled = plg->cfg.crl_fetch_enabled;
+		new_cfg.crl_fetch_timeout_ms = plg->cfg.crl_fetch_timeout_ms;
+		new_cfg.crl_fetch_max_size = plg->cfg.crl_fetch_max_size;
+		new_cfg.crl_fetch_cache_ttl = plg->cfg.crl_fetch_cache_ttl;
+		new_cfg.ldap.require_tls = plg->cfg.ldap.require_tls;
+		new_cfg.ldap.connect_timeout_ms = plg->cfg.ldap.connect_timeout_ms;
+		new_cfg.ldap.op_timeout_ms = plg->cfg.ldap.op_timeout_ms;
+		new_cfg.ldap.search_cache_ttl = plg->cfg.ldap.search_cache_ttl;
+		new_cfg.audit.fsync_per_line = plg->cfg.audit.fsync_per_line;
+		new_cfg.audit.syslog_enabled = plg->cfg.audit.syslog_enabled;
+		new_cfg.audit.level = plg->cfg.audit.level;
+		new_cfg.audit.line_cap_bytes = plg->cfg.audit.line_cap_bytes;
+		new_cfg.audit.include_chain_detail = plg->cfg.audit.include_chain_detail;
+		new_cfg.audit.chain_detail_max_depth = plg->cfg.audit.chain_detail_max_depth;
+		new_cfg.audit.include_san = plg->cfg.audit.include_san;
+		new_cfg.audit.include_custom_oids = plg->cfg.audit.include_custom_oids;
+		new_cfg.audit.include_eval_timing = plg->cfg.audit.include_eval_timing;
+		new_cfg.acl_include_payload = plg->cfg.acl_include_payload;
 	}
 
 	new_trust = build_trust_store(&new_cfg);

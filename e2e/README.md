@@ -57,4 +57,5 @@ paths), `policy.rego` (with fingerprints substituted), `broker.log`,
 | `audit_line_truncation_kicks_in` | Every audit line stays within the configured line cap (8 KB in e2e). |
 | `audit_deny_carries_full_metadata` | An ACL deny line carries the same cert identity fields an allow line does — CN, DNs, serial, fingerprint, trust anchor FP, chain_ok, chain_errors, decision_id, client_id, remote_addr. |
 | `policy_note_at_debug_only` | The Rego `audit.log(message)` host function emits a `policy.note` event at DEBUG with the message body. |
+| `reload_race_under_load_atomic_swap` | Alternating-policy SIGHUP every 150 ms for 3 s while 4 client threads hammer connect+publish: broker survives, audit stays parseable, `decision_id`s remain unique, both policy tags observed, post-race connect still works. |
 | `reload_broken_policy_keeps_previous` | SIGHUP with a syntactically broken policy file leaves the broker up and serving under the old policy. |

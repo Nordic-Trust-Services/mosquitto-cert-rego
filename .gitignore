@@ -1,0 +1,59 @@
+# Build artefacts
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Object files and libraries
+*.o
+*.so
+*.so.*
+*.a
+*.d
+*.la
+*.lo
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Editors / IDEs
+.vscode/
+.idea/
+.cache/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Generated PKI from gen_test_certs.sh — never commit private keys
+pki/
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+
+# Audit logs
+*.log
+
+# Policy bundles operators might drop in
+policies/*.rego
+!policies/.gitkeep
+
+# OS artefacts
+.DS_Store
+Thumbs.db

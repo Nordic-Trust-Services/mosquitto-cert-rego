@@ -1,0 +1,91 @@
+# Build + test on every push and PR.
+#
+# The expensive step is building rego-cpp from source (no pre-built
+# distribution on Ubuntu). We cache the install tree keyed on the
+# rego-cpp commit SHA so subsequent runs skip the compile.
+
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    env:
+      REGOCPP_REF: main
+      REGOCPP_PREFIX: ${{ github.workspace }}/regocpp-install
+      REGOCPP_BUILD:  ${{ github.workspace }}/regocpp-build
+      BUILD_DIR:      ${{ github.workspace }}/build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: APT dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build git \
+            libssl-dev libcjson-dev libldap2-dev libmosquitto-dev
+
+      - name: Resolve rego-cpp SHA
+        id: regocpp-sha
+        run: |
+          SHA=$(git ls-remote https://github.com/microsoft/rego-cpp.git \
+                  refs/heads/$REGOCPP_REF | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "rego-cpp $REGOCPP_REF is at $SHA"
+
+      - name: Cache rego-cpp install
+        id: regocpp-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.REGOCPP_PREFIX }}
+          key: regocpp-${{ runner.os }}-${{ steps.regocpp-sha.outputs.sha }}
+
+      - name: Build rego-cpp
+        if: steps.regocpp-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch $REGOCPP_REF \
+              https://github.com/microsoft/rego-cpp.git regocpp-src
+          cmake -B $REGOCPP_BUILD -S regocpp-src -G Ninja \
+              -DCMAKE_INSTALL_PREFIX=$REGOCPP_PREFIX \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DREGOCPP_BUILD_TESTS=OFF \
+              -DREGOCPP_BUILD_TOOLS=OFF
+          cmake --build $REGOCPP_BUILD -j
+          cmake --install $REGOCPP_BUILD
+
+          # rego-cpp's cmake --install doesn't currently ship the
+          # transitive trieste / snmalloc headers. Copy them over.
+          cp -r $REGOCPP_BUILD/_deps/trieste-src/include/* $REGOCPP_PREFIX/include/
+          cp -r $REGOCPP_BUILD/_deps/trieste-build/include/* $REGOCPP_PREFIX/include/
+          cp -r $REGOCPP_BUILD/_deps/snmalloc-src/src/snmalloc $REGOCPP_PREFIX/include/
+
+      - name: Configure
+        run: |
+          cmake -B $BUILD_DIR -S . -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DREGOCPP_ROOT=$REGOCPP_PREFIX
+
+      - name: Build
+        run: cmake --build $BUILD_DIR -j
+
+      - name: Test
+        run: ctest --test-dir $BUILD_DIR --output-on-failure
+
+      - name: Inspect plugin symbols
+        run: |
+          nm -D $BUILD_DIR/mosquitto_cert_rego.so | \
+              grep -E ' T mosquitto_plugin' || \
+              (echo "expected mosquitto_plugin_* symbols missing"; exit 1)

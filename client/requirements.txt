@@ -1,0 +1,6 @@
+# Runtime dependencies for cert_rego_client.py.
+#
+# paho-mqtt 2.x is required because the client uses CallbackAPIVersion.VERSION2
+# (v5 reason codes in the callback signatures). Older versions of paho will
+# not import.
+paho-mqtt>=2.0,<3.0

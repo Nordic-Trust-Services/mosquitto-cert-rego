@@ -1,0 +1,12 @@
+mosquitto-cert-rego is dual-licensed under:
+
+  * Eclipse Public License 2.0 (EPL-2.0)  — see LICENSES/EPL-2.0.txt
+  * Eclipse Distribution License 1.0 / BSD-3-Clause (BSD-3-Clause)
+    — see LICENSES/BSD-3-Clause.txt
+
+This matches upstream Eclipse Mosquitto. Recipients may choose either
+license. SPDX-License-Identifier for every source file is:
+
+    SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
+
+The full text of each license is reproduced in the LICENSES/ directory.

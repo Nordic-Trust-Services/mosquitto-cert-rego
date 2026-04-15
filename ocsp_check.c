@@ -40,6 +40,8 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <time.h>
 
 #ifndef WIN32
@@ -149,11 +151,19 @@ static OCSP_RESPONSE *ocsp_http_send(const char *host, const char *port,
 	snprintf(host_port, sizeof(host_port), "%s:%s", host, port);
 
 	bio = BIO_new_connect(host_port);
-	if(!bio) return NULL;
+	if(!bio){
+		return NULL;
+	}
 
-	BIO_set_nbio(bio, 1);
+	/* Bound DNS + connect with a non-blocking phase against the deadline,
+	 * then switch to blocking I/O for the HTTP exchange. OpenSSL 3.0's
+	 * OCSP_sendreq_nbio interop with HTTP/1.0 responders (openssl ocsp
+	 * server, real responders behind reverse proxies) was unreliable in
+	 * our testing — OCSP_sendreq_bio is the synchronous variant the
+	 * openssl CLI itself uses and just works. Per-socket SO_RCVTIMEO
+	 * gives us a hard ceiling instead of a select() loop. */
 	deadline = now_ms() + timeout_ms;
-
+	BIO_set_nbio(bio, 1);
 	for(;;){
 		long crv = BIO_do_connect(bio);
 		if(crv > 0) break;
@@ -170,42 +180,31 @@ static OCSP_RESPONSE *ocsp_http_send(const char *host, const char *port,
 			return NULL;
 		}
 	}
-
-	ctx = OCSP_sendreq_new(bio, path, NULL, -1);
-	if(!ctx){
-		BIO_free_all(bio);
-		return NULL;
-	}
-
-	if(!OCSP_REQ_CTX_add1_header(ctx, "Host", host)
-			|| !OCSP_REQ_CTX_set1_req(ctx, req)){
-		OCSP_REQ_CTX_free(ctx);
-		BIO_free_all(bio);
-		return NULL;
-	}
-
-	for(;;){
-		rv = OCSP_sendreq_nbio(&resp, ctx);
-		if(rv == 1) break;                  /* done */
-		if(rv == 0){                        /* retry */
-			if(bio_wait(bio, deadline) <= 0){
-				mosquitto_log_printf(MOSQ_LOG_WARNING,
-						"cert-rego: OCSP request to %s timed out", host_port);
-				OCSP_REQ_CTX_free(ctx);
-				BIO_free_all(bio);
-				return NULL;
-			}
-			continue;
+	BIO_set_nbio(bio, 0);
+	{
+		int fd = -1;
+		if(BIO_get_fd(bio, &fd) >= 0 && fd >= 0){
+			struct timeval tv;
+			long remaining = deadline - now_ms();
+			if(remaining < 100) remaining = 100;
+			tv.tv_sec = remaining / 1000;
+			tv.tv_usec = (remaining % 1000) * 1000;
+			(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+			(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 		}
-		/* rv < 0 — protocol error */
+	}
+
+	resp = OCSP_sendreq_bio(bio, path, req);
+	if(!resp){
 		mosquitto_log_printf(MOSQ_LOG_WARNING,
-				"cert-rego: OCSP request to %s failed", host_port);
-		OCSP_REQ_CTX_free(ctx);
+				"cert-rego: OCSP request to %s failed (sendreq_bio returned null)",
+				host_port);
 		BIO_free_all(bio);
 		return NULL;
 	}
 
-	OCSP_REQ_CTX_free(ctx);
+	(void)ctx;
+	(void)rv;
 	BIO_free_all(bio);
 	return resp;
 }

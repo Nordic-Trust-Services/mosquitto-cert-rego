@@ -17,6 +17,10 @@ if [ ! -f "${E2E_DIR}/pki/expired_alice.crt" ]; then
     echo "==> generating negative-case certs"
     "${E2E_DIR}/gen-negative-certs.sh"
 fi
+if [ ! -f "${E2E_DIR}/pki/ocsp_signer.crt" ]; then
+    echo "==> generating OCSP fixtures"
+    "${E2E_DIR}/_gen_ocsp_fixtures.py" "${E2E_DIR}/pki"
+fi
 
 "${E2E_DIR}/stop-broker.sh" >/dev/null || true
 "${E2E_DIR}/run-broker.sh"

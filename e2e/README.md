@@ -58,4 +58,7 @@ paths), `policy.rego` (with fingerprints substituted), `broker.log`,
 | `audit_deny_carries_full_metadata` | An ACL deny line carries the same cert identity fields an allow line does — CN, DNs, serial, fingerprint, trust anchor FP, chain_ok, chain_errors, decision_id, client_id, remote_addr. |
 | `policy_note_at_debug_only` | The Rego `audit.log(message)` host function emits a `policy.note` event at DEBUG with the message body. |
 | `reload_race_under_load_atomic_swap` | Alternating-policy SIGHUP every 150 ms for 3 s while 4 client threads hammer connect+publish: broker survives, audit stays parseable, `decision_id`s remain unique, both policy tags observed, post-race connect still works. |
+| `ocsp_good_cert_allowed` | Cert with `status:good` from a live OCSP responder is allowed by an `ocsp.check()`-gated policy. |
+| `ocsp_revoked_cert_denied` | Cert revoked at the responder is denied by the same policy. |
+| `ocsp_responder_unreachable_fail_closed` | Same policy, responder down: `status:error` flows through Rego as deny — fail-closed. |
 | `reload_broken_policy_keeps_previous` | SIGHUP with a syntactically broken policy file leaves the broker up and serving under the old policy. |

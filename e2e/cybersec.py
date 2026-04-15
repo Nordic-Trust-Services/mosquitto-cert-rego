@@ -499,6 +499,197 @@ def t_reload_race() -> None:
         )
 
 
+# --------------------------------------------------------------------------
+# OCSP revocation
+# --------------------------------------------------------------------------
+
+import contextlib
+
+
+@contextlib.contextmanager
+def ocsp_responder():
+    """Run a throwaway openssl OCSP responder on 127.0.0.1:18888, serving
+    the e2e/pki/ocsp_index.txt file. Yields the subprocess.Popen so tests
+    can assert it's still alive. Kills it on exit."""
+    cmd = [
+        "openssl", "ocsp",
+        "-index", str(PKI/"ocsp_index.txt"),
+        "-port", "18888",
+        "-rsigner", str(PKI/"ocsp_signer.crt"),
+        "-rkey", str(PKI/"ocsp_signer.key"),
+        "-CA", str(PKI/"intermediate_a.crt"),
+        "-ignore_err",
+    ]
+    # Suppress the responder's per-request text dump.
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    # Wait for the listener to come up.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            probe = subprocess.run(
+                ["ss", "-ltn"], capture_output=True, text=True, timeout=2
+            )
+            if ":18888 " in probe.stdout:
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    else:
+        proc.kill()
+        raise TestFailure("OCSP responder failed to start on :18888")
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _install_ocsp_policy(current_policy: pathlib.Path) -> str:
+    """Overwrite policy.rego with a policy that gates CONNECT on
+    ocsp.check() returning 'good' for the leaf. Returns the prior
+    contents so the caller can restore. Triggers SIGHUP."""
+    pid = int((RUN/"broker.pid").read_text().strip())
+    previous = current_policy.read_text()
+
+    fp_a = subprocess.check_output(
+        ["openssl", "x509", "-in", str(PKI/"root_a.crt"),
+         "-noout", "-fingerprint", "-sha256"],
+        text=True,
+    ).strip().split("=", 1)[1].replace(":", "").lower()
+    fp_b = subprocess.check_output(
+        ["openssl", "x509", "-in", str(PKI/"root_b.crt"),
+         "-noout", "-fingerprint", "-sha256"],
+        text=True,
+    ).strip().split("=", 1)[1].replace(":", "").lower()
+
+    current_policy.write_text(textwrap.dedent(f"""\
+        package mqtt
+
+        root_a_fp := "{fp_a}"
+        root_b_fp := "{fp_b}"
+
+        anchor_fp := input.cert.trust_anchor.fingerprint_sha256
+        is_operator {{ anchor_fp == root_a_fp }}
+
+        default connect := false
+        default acl := false
+
+        # Inline so the diagnostic audit line fires before the status gate —
+        # even a denied connect leaves a policy.note with the observed OCSP
+        # status, which is how an operator under a strict policy debugs the
+        # responder.
+        connect {{
+            input.cert.chain_ok
+            input.cert.cn != ""
+            is_operator
+            raw := ocsp.check()
+            audit.log(sprintf("ocsp_raw=%v", [raw]))
+            ocsp_results := json.unmarshal(raw)
+            status := ocsp_results[0].status
+            audit.log(sprintf("ocsp=%v cn=%v err=%v", [status, input.cert.cn, ocsp_results[0].error]))
+            status == "good"
+        }}
+
+        acl {{ is_operator; startswith(input.acl.topic, "devices/") }}
+    """))
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.2)
+    return previous
+
+
+def _restore_policy(current_policy: pathlib.Path, previous: str) -> None:
+    pid = int((RUN/"broker.pid").read_text().strip())
+    current_policy.write_text(previous)
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.2)
+
+
+@test("ocsp_good_cert_allowed")
+def t_ocsp_good() -> None:
+    """With ocsp.check() returning 'good' for the leaf, the policy allows
+    the connect and emits an audit line tagged ocsp=good."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_ocsp_policy(current_policy)
+    try:
+        with ocsp_responder():
+            reset_audit()
+            cp = do_publish("ocsp_good_alice.crt", "ocsp_good_alice.key",
+                            "ocsp-good", "devices/ocsp-good/x", "hi")
+            if cp.returncode != 0:
+                raise TestFailure(
+                    f"good OCSP cert was rejected: {cp.stdout!r} / {cp.stderr!r}"
+                )
+            time.sleep(0.3)
+            lines = read_audit()
+            notes = [l.get("note", "") for l in lines
+                     if l.get("event") == "policy.note"]
+            if not any("ocsp=good" in n for n in notes):
+                raise TestFailure(
+                    f"expected ocsp=good in policy.note, got notes: {notes}"
+                )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("ocsp_revoked_cert_denied")
+def t_ocsp_revoked() -> None:
+    """With ocsp.check() returning 'revoked' for the leaf, the policy
+    denies. The connect line must record chain_ok=true (the chain itself
+    verifies) yet still be denied."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_ocsp_policy(current_policy)
+    try:
+        with ocsp_responder():
+            reset_audit()
+            cp = do_publish("ocsp_revoked_alice.crt", "ocsp_revoked_alice.key",
+                            "ocsp-revoked", "devices/ocsp-revoked/x", "hi")
+            if cp.returncode == 0:
+                raise TestFailure("revoked OCSP cert was accepted!")
+            lines = wait_for_audit(
+                lambda ls: any(l.get("event") == "connect"
+                               and l.get("result") == "deny"
+                               for l in ls)
+            )
+            deny = next(l for l in lines if l.get("event") == "connect"
+                        and l.get("result") == "deny")
+            if not deny.get("chain_ok"):
+                raise TestFailure(
+                    "deny says chain_ok=false, but the cert chain itself is fine "
+                    "(revocation is an orthogonal signal)"
+                )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("ocsp_responder_unreachable_fail_closed")
+def t_ocsp_unreachable() -> None:
+    """When the OCSP responder is NOT running, ocsp.check() on the leaf
+    returns status='error'. Our test policy only allows `good`, so the
+    decision is deny — proving fail-closed semantics on OCSP outage."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_ocsp_policy(current_policy)
+    try:
+        reset_audit()
+        cp = do_publish("ocsp_good_alice.crt", "ocsp_good_alice.key",
+                        "ocsp-outage", "devices/ocsp-outage/x", "hi")
+        if cp.returncode == 0:
+            raise TestFailure(
+                "OCSP-unreachable cert was accepted; expected fail-closed deny"
+            )
+        wait_for_audit(
+            lambda ls: any(l.get("event") == "connect"
+                           and l.get("result") == "deny"
+                           for l in ls)
+        )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
 @test("reload_broken_policy_keeps_previous")
 def t_reload_broken() -> None:
     """SIGHUP the broker with a syntactically broken policy. The broker must

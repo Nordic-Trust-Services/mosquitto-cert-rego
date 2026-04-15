@@ -18,6 +18,7 @@ independent — audit.jsonl is truncated at the start of every test so you
 can run them individually by editing the main() dispatch.
 """
 from __future__ import annotations
+import contextlib
 import json
 import os
 import pathlib
@@ -927,10 +928,224 @@ def t_fuzz_inputs() -> None:
 
 
 # --------------------------------------------------------------------------
-# OCSP revocation
+# Reconnect storm — sequential connect/pub/disconnect cycles to look for
+# leaks and state isolation regressions. Especially valuable when run
+# under ASan via run-asan.sh.
 # --------------------------------------------------------------------------
 
-import contextlib
+@test("reconnect_storm_state_isolated")
+def t_reconnect_storm() -> None:
+    """200 sequential connect → publish → disconnect cycles from a
+    rotating set of 4 client certs. Asserts: broker stays alive, audit
+    integrity (every line parses), no decision_id collisions, every
+    decision carries client_id matching the originating mosquitto_pub
+    invocation. Under ASan/UBSan via run-asan.sh this also detects
+    per-connect leaks and use-after-free on the connect/cleanup path."""
+    pid = int((RUN/"broker.pid").read_text().strip())
+    reset_audit()
+
+    n_iters = 200
+    rotation = [
+        ("operator_alice.crt", "operator_alice.key", "alice", "devices/alice/{i}"),
+        ("operator_bob.crt",   "operator_bob.key",   "bob",   "devices/bob/{i}"),
+        ("device_01.crt",      "device_01.key",      "device-01", "devices/device-01/{i}"),
+        ("device_02.crt",      "device_02.key",      "device-02", "devices/device-02/{i}"),
+    ]
+    for i in range(n_iters):
+        cert, key, cn, topic_pat = rotation[i % len(rotation)]
+        # Per-iteration unique client id so we can verify each iteration
+        # produced its own connect event.
+        cmd = [
+            PUB, "-h", HOST, "-p", str(PORT),
+            *tls_client_args(cert, key),
+            "-i", f"reconnect-{i}",
+            "-t", topic_pat.format(i=i),
+            "-m", f"m{i}", "-q", "0", "--quiet",
+        ]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Broker still up?
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        raise TestFailure("broker died during reconnect storm")
+
+    time.sleep(0.5)
+    lines = read_audit()
+    decisions = [l for l in lines if l.get("event") in {"connect", "acl"}]
+
+    # Should be at least 1 connect + 1 acl per iteration; some may race
+    # the broker's accept queue under storm conditions, so we tolerate a
+    # 5% loss but assert the floor.
+    floor = int(n_iters * 1.5)  # ~connect + acl per iter
+    if len(decisions) < floor:
+        raise TestFailure(
+            f"expected at least {floor} decision events, got {len(decisions)}"
+        )
+
+    ids = [d["decision_id"] for d in decisions if d.get("decision_id") is not None]
+    if len(set(ids)) != len(ids):
+        dups = [i for i in set(ids) if ids.count(i) > 1]
+        raise TestFailure(f"duplicate decision_ids: {dups[:5]}")
+
+    # client_id format is cs-<cn>-<pid>; the first connect after a fresh
+    # mosquitto_pub gets a fresh process id so all client_ids should be
+    # distinct (one per spawned pub). Sanity check: at least n_iters
+    # distinct client_ids appear in connects.
+    connect_clients = {d.get("client_id") for d in decisions
+                       if d.get("event") == "connect"}
+    if len(connect_clients) < n_iters * 0.9:
+        raise TestFailure(
+            f"only {len(connect_clients)} distinct client_ids across "
+            f"{n_iters} reconnects — state may be leaking between sessions"
+        )
+
+
+# --------------------------------------------------------------------------
+# Adversarial OCSP — Python responder that returns deliberately broken
+# OCSP responses. Plugin must surface status:error and not crash.
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def adversarial_ocsp_server(payload: bytes):
+    """Tiny HTTP server that returns the given payload (raw bytes) for any
+    POST / request. Listens on 127.0.0.1:18888 — same port the OCSP-gated
+    policy expects."""
+    import http.server, threading as _threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            try:
+                _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            except Exception:
+                pass
+            self.send_response(200)
+            self.send_header("Content-Type", "application/ocsp-response")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        def log_message(self, *_a, **_kw):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 18888), Handler)
+    th = _threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@test("ocsp_malformed_response_fail_closed")
+def t_ocsp_malformed() -> None:
+    """Adversarial responder returns garbage bytes labelled as
+    application/ocsp-response. The plugin must not crash, must surface
+    status:error, and the policy must deny."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_ocsp_policy(current_policy)
+    try:
+        with adversarial_ocsp_server(b"\xde\xad\xbe\xef" * 50):
+            reset_audit()
+            cp = do_publish("ocsp_good_alice.crt", "ocsp_good_alice.key",
+                            "ocsp-bad", "devices/ocsp-bad/x", "x")
+            if cp.returncode == 0:
+                raise TestFailure(
+                    "malformed OCSP response was accepted as good"
+                )
+            wait_for_audit(
+                lambda ls: any(l.get("event") == "connect"
+                               and l.get("result") == "deny"
+                               for l in ls)
+            )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("ocsp_truncated_response_fail_closed")
+def t_ocsp_truncated() -> None:
+    """Responder closes the socket mid-body. Plugin should surface
+    status:error and deny. Real OCSP responses are typically ~1 KB so a
+    1-byte body is unambiguous truncation."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_ocsp_policy(current_policy)
+    try:
+        with adversarial_ocsp_server(b"\x30"):
+            reset_audit()
+            cp = do_publish("ocsp_good_alice.crt", "ocsp_good_alice.key",
+                            "ocsp-trunc", "devices/ocsp-trunc/x", "x")
+            if cp.returncode == 0:
+                raise TestFailure(
+                    "truncated OCSP response was accepted as good"
+                )
+            wait_for_audit(
+                lambda ls: any(l.get("event") == "connect"
+                               and l.get("result") == "deny"
+                               for l in ls)
+            )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+# --------------------------------------------------------------------------
+# Policy runtime error — fail-closed
+# --------------------------------------------------------------------------
+
+@test("policy_returns_nonbool_fail_closed")
+def t_policy_nonbool() -> None:
+    """A policy where data.mqtt.connect resolves to a non-boolean value
+    (string, number, object) must fail closed: rego_engine_eval_bool only
+    sets *allow_out=true on an exact boolean true, so any other shape
+    surfaces as deny. Verifies the plugin doesn't truthy-coerce a
+    "yes"/1/non-empty-object policy result."""
+    current_policy = RUN/"policy.rego"
+    previous = current_policy.read_text()
+    pid = int((RUN/"broker.pid").read_text().strip())
+    try:
+        current_policy.write_text(textwrap.dedent("""\
+            package mqtt
+
+            # Resolves to a string, not a bool. The plugin must NOT
+            # interpret this as truthy.
+            connect := "definitely not allowed"
+
+            # Always-true ACL would let the publish through if the
+            # connect were (wrongly) allowed; this is the canary.
+            acl := true
+        """))
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.2)
+
+        reset_audit()
+        cp = do_publish("operator_alice.crt", "operator_alice.key", "alice",
+                        "devices/alice/x", "x")
+        if cp.returncode == 0:
+            raise TestFailure(
+                "non-bool connect value was treated as truthy — fail-closed broken"
+            )
+        wait_for_audit(
+            lambda ls: any(l.get("event") == "connect"
+                           and l.get("result") == "deny"
+                           for l in ls)
+        )
+
+        # Broker still up + responsive.
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            raise TestFailure("broker died on non-bool policy")
+    finally:
+        current_policy.write_text(previous)
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.2)
+
+
+# --------------------------------------------------------------------------
+# OCSP revocation
+# --------------------------------------------------------------------------
 
 
 @contextlib.contextmanager

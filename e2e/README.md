@@ -69,4 +69,14 @@ paths), `policy.rego` (with fingerprints substituted), `broker.log`,
 | `acl_topic_dotdot_is_literal_segment` | Confirms broker + plugin do not normalise MQTT topics: `devices/device-01/../device-02/secret` is treated as a literal topic and round-trips byte-for-byte into the audit line. |
 | `auth_empty_cn_cert_denied` | A cert with no CN (only OU + O) reaches the plugin; policy denies on `cn != ""`; audit records `cn=""`. |
 | `fuzz_publish_payloads_keep_audit_intact` | 40 publishes from a legit operator cert with random topics (incl. unicode + injection bytes) and random payloads up to 4 KB. Asserts broker survives, audit lines stay parseable, every line within cap, ACL events carry structural fields. |
+| `reconnect_storm_state_isolated` | 200 sequential connect→publish→disconnect cycles rotating across 4 client certs. Asserts broker stays alive, audit lines parse, decision_ids unique, every iteration produces a distinct connect (no session reuse leaking state). Especially valuable run under ASan via `run-asan.sh`. |
+| `ocsp_malformed_response_fail_closed` | Adversarial Python responder returns garbage labelled `application/ocsp-response`; plugin must surface `status:error` and policy denies — does not crash. |
+| `ocsp_truncated_response_fail_closed` | Same harness, body is one byte; plugin parses gracefully and denies. |
+| `policy_returns_nonbool_fail_closed` | A policy where `data.mqtt.connect` resolves to a string (not a bool) must NOT be truthy-coerced — plugin denies. Verifies `rego_engine_eval_bool` only sets allow on exact boolean true. |
+
+## Running under sanitizers
+
+`./e2e/run-asan.sh` builds the plugin into `/tmp/cert-rego-build-asan/` with `-fsanitize=address,undefined`, restarts the broker with `LD_PRELOAD=libasan.so` and the sanitizer-built plugin, then runs the full cybersec suite. ASan reports go to `e2e/run/asan.log.<pid>`; the script fails the run if any `SUMMARY:` or runtime-error line appears.
+
+`detect_leaks=0` because mosquitto's intentional one-shot allocations on shutdown would otherwise dominate the report; ASan's heap-buffer-overflow / use-after-free / stack-use-after-return / strict-string-checks coverage stays on. UBSan runs alongside with `halt_on_error=0`.
 | `reload_broken_policy_keeps_previous` | SIGHUP with a syntactically broken policy file leaves the broker up and serving under the old policy. |

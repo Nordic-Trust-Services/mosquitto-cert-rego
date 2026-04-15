@@ -664,7 +664,10 @@ static char *build_acl_input(struct mosquitto *client,
 		mosquitto_free(payload_b64);
 	}
 
-	if(!client_frag || !topic_esc || (include_payload && !payload_esc)){
+	/* include_payload is "expose payload IF present", not "require payload";
+	 * subscribe and unsubscribe events have no payload and must still build
+	 * a valid ACL input doc. */
+	if(!client_frag || !topic_esc){
 		mosquitto_free(client_frag);
 		mosquitto_free(topic_esc);
 		mosquitto_free(payload_esc);

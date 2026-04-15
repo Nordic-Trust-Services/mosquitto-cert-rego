@@ -215,6 +215,115 @@ def t_acl_fleet_wildcard_from_device() -> None:
     )
 
 
+@test("acl_topic_dotdot_is_literal_segment")
+def t_acl_topic_traversal() -> None:
+    """In MQTT, `..` is a literal topic segment with no special meaning —
+    broker and plugin must NOT normalise it as a path-style parent
+    reference. We assert two properties:
+
+      1. The plugin's audit line records the topic byte-for-byte as the
+         publisher sent it (no normalisation that would let a deny mask
+         what the client actually intended).
+      2. device_01's policy startswith("devices/device-01/") matches a
+         topic that begins with that literal — including pathological
+         "devices/device-01/../device-02/secret" — so this is allowed.
+         (No-one subscribes to that exact literal topic, so the
+         publish goes nowhere; this is a MQTT semantic, not a security
+         hole. Operators relying on path-style isolation should add an
+         explicit `not contains(topic, "..")` check in policy.)
+    """
+    reset_audit()
+    weird_topic = "devices/device-01/../device-02/secret"
+    do_publish("device_01.crt", "device_01.key", "device-01", weird_topic, "x")
+    lines = wait_for_audit(
+        lambda ls: any(l.get("event") == "acl" for l in ls)
+    )
+    acl = next(l for l in lines if l.get("event") == "acl")
+    if acl.get("topic") != weird_topic:
+        raise TestFailure(
+            f"topic was rewritten by broker/plugin? got {acl.get('topic')!r}"
+        )
+
+
+@test("auth_empty_cn_cert_denied")
+def t_empty_cn() -> None:
+    """A cert with no CN at all (only OU + O) reaches the plugin (TLS
+    accepts any properly-signed leaf), but our policy denies on
+    `cn != ""`. The audit line records cn="" so an operator can see why
+    a connect was refused."""
+    import datetime as _dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+    ca_cert = x509.load_pem_x509_certificate((PKI/"intermediate_a.crt").read_bytes())
+    ca_key  = serialization.load_pem_private_key((PKI/"intermediate_a.key").read_bytes(), password=None)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    # Subject with no CN.
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "no-cn-org"),
+        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "stealth"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_dt.datetime(2024, 1, 1))
+        .not_valid_after(_dt.datetime(2034, 1, 1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=True,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    cert_path = RUN/"empty_cn.crt"
+    key_path  = RUN/"empty_cn.key"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+    )
+    key_path.chmod(0o600)
+
+    reset_audit()
+    cmd = [
+        PUB, "-h", HOST, "-p", str(PORT),
+        "--cafile", str(PKI/"bundle_all.pem"),
+        "--tls-version", "tlsv1.2",
+        "--cert", str(cert_path), "--key", str(key_path),
+        "-i", "no-cn", "-t", "devices/whatever/x", "-m", "x", "-q", "0",
+        "--quiet",
+    ]
+    cp = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    if cp.returncode == 0:
+        raise TestFailure("empty-CN cert was accepted by policy!")
+    lines = wait_for_audit(
+        lambda ls: any(l.get("event") == "connect"
+                       and l.get("result") == "deny"
+                       for l in ls)
+    )
+    deny = next(l for l in lines if l.get("event") == "connect"
+                and l.get("result") == "deny")
+    if deny.get("cn") != "":
+        raise TestFailure(
+            f"empty-CN cert audit cn was {deny.get('cn')!r}, expected empty"
+        )
+
+
 @test("audit_framing_cn_injection")
 def t_cn_injection() -> None:
     """A cert whose CN contains quote/backslash/newline must not break audit
@@ -497,6 +606,115 @@ def t_reload_race() -> None:
         raise TestFailure(
             f"post-race connect failed: {cp.stdout!r} / {cp.stderr!r}"
         )
+
+
+# --------------------------------------------------------------------------
+# Publish-payload fuzzer (input.acl.payload_b64 + topic strings)
+# --------------------------------------------------------------------------
+
+@test("fuzz_publish_payloads_keep_audit_intact")
+def t_fuzz_payloads() -> None:
+    """Hammer the broker with adversarial publishes from a single legit
+    operator cert: random topics (including nulls, slashes, unicode) and
+    random payloads (including JSON-shaped strings, control bytes, sizes
+    up to 4 KB). The plugin must:
+
+      - keep the audit log line-framed and JSON-parseable for every event
+      - never exceed the configured line cap
+      - record an acl event for each publish with a `topic` field that
+        round-trips the bytes the broker actually saw
+
+    Mosquitto strips embedded NULs from topics at the protocol level, so
+    we don't expect bytes-perfect topic round-trip; instead we assert
+    structural properties: line is JSON, topic is a string, ACL line
+    fields are present.
+    """
+    rng = random.Random(987654321)
+    pid = int((RUN/"broker.pid").read_text().strip())
+
+    cmd_pub = [
+        PUB, "-h", HOST, "-p", str(PORT),
+        *tls_client_args("operator_alice.crt", "operator_alice.key"),
+    ]
+
+    reset_audit()
+
+    n_iters = 40
+    for i in range(n_iters):
+        # Random topic under devices/* so the existing operator policy
+        # allows it. Append fuzz noise after a fixed prefix to keep ACL
+        # acceptance paths stable.
+        suffix_alphabet = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+        # 10% of iterations: topic with high-ASCII / unicode bytes
+        if rng.random() < 0.1:
+            suffix_alphabet += "äöü€☃"
+        # 5% of iterations: try a literal `"` and `\` in the topic
+        if rng.random() < 0.05:
+            suffix_alphabet += '"\\\n'
+        suffix = "".join(rng.choice(suffix_alphabet)
+                         for _ in range(rng.randint(1, 60)))
+        topic = f"devices/fuzz/{i}/{suffix}"
+
+        # Payload: random bytes 0..4096, occasionally JSON-shaped
+        plen = rng.choice([0, 1, 16, 256, 1024, 3000, 4096])
+        if rng.random() < 0.2:
+            payload = b'{"injected":"' + b"a" * (plen - 14) + b'"}'
+        else:
+            payload = bytes(rng.randint(0, 255) for _ in range(plen))
+
+        # Use stdin to feed the payload so binary survives.
+        cmd = cmd_pub + [
+            "-i", f"pf-{i}",
+            "-t", topic,
+            "-l",  # one message per line of stdin
+            "-q", "0",
+            "--quiet",
+        ]
+        # mosquitto_pub -l reads lines; for binary we use -s to slurp stdin
+        # as a single message.
+        cmd = cmd_pub + [
+            "-i", f"pf-{i}",
+            "-t", topic,
+            "-s",
+            "-q", "0",
+            "--quiet",
+        ]
+        try:
+            subprocess.run(cmd, input=payload, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Broker still alive
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        raise TestFailure("broker died during payload fuzz")
+
+    time.sleep(0.5)
+    lines = read_audit()  # raises if any line is broken JSON
+
+    acls = [l for l in lines if l.get("event") == "acl"]
+    if len(acls) < n_iters // 2:
+        # A flaky --quiet -s could drop a few but not half.
+        raise TestFailure(
+            f"expected at least {n_iters//2} acl events, got {len(acls)}"
+        )
+
+    # Every acl line must have the structural fields and a string topic.
+    for ev in acls:
+        for f in ("topic", "action", "qos", "decision_id", "cn"):
+            if f not in ev:
+                raise TestFailure(f"acl line missing {f}: {ev}")
+        if not isinstance(ev["topic"], str):
+            raise TestFailure(f"topic not string: {ev}")
+
+    # Every line bounded by the configured cap (8 KB in e2e).
+    with open(AUDIT, "rb") as f:
+        for raw in f:
+            if len(raw) > 9000:
+                raise TestFailure(
+                    f"audit line exceeds cap+slack: {len(raw)} bytes"
+                )
 
 
 # --------------------------------------------------------------------------
@@ -1006,6 +1224,42 @@ def t_crl_revoked() -> None:
                 raise TestFailure(
                     f"expected crl=revoked note, got: {notes}"
                 )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("crl_url_scheme_allowlist_blocks_file_uri")
+def t_crl_ssrf() -> None:
+    """A cert whose crlDistributionPoints points at file:///etc/passwd
+    must not cause the plugin to read the file. http_fetch.c's URL parser
+    only accepts http:// and https://; for any other scheme crl.check()
+    must surface status:error and the policy denies. This is the
+    fail-closed defence against SSRF via attacker-shaped URLs in client
+    certificates."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_crl_policy(current_policy)
+    try:
+        # No HTTP server; even if URL was http it would fail. Important
+        # bit: the policy should deny BEFORE any side-effect of
+        # interpreting file:// occurs.
+        reset_audit()
+        cp = do_publish("crl_ssrf_alice.crt", "crl_ssrf_alice.key",
+                        "crl-ssrf", "devices/crl-ssrf/x", "hi")
+        if cp.returncode == 0:
+            raise TestFailure(
+                "cert with file:// CRL DP was accepted; SSRF defence failed"
+            )
+        lines = wait_for_audit(
+            lambda ls: any(l.get("event") == "connect"
+                           and l.get("result") == "deny"
+                           for l in ls)
+        )
+        notes = [l.get("note", "") for l in lines
+                 if l.get("event") == "policy.note"]
+        if not any("crl=" in n and "good" not in n for n in notes):
+            raise TestFailure(
+                f"expected non-good crl= status in note, got: {notes}"
+            )
     finally:
         _restore_policy(current_policy, previous)
 

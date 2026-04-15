@@ -65,4 +65,8 @@ paths), `policy.rego` (with fingerprints substituted), `broker.log`,
 | `crl_good_cert_allowed` | Cert listed nowhere in the CRL gets `status:good` from the local HTTP-served CRL and is allowed by a `crl.check()`-gated policy. |
 | `crl_revoked_cert_denied` | Cert whose serial appears in the CRL gets `status:revoked` and is denied. |
 | `crl_fetcher_unreachable_fail_closed` | Same policy, CRL HTTP server down: `status:error` → deny. |
+| `crl_url_scheme_allowlist_blocks_file_uri` | A cert whose `crlDistributionPoints` points at `file:///etc/passwd` does NOT cause the plugin to read the file — `http_fetch.c` only accepts http/https schemes; `crl.check()` returns `status:error err:fetch failed` → deny. |
+| `acl_topic_dotdot_is_literal_segment` | Confirms broker + plugin do not normalise MQTT topics: `devices/device-01/../device-02/secret` is treated as a literal topic and round-trips byte-for-byte into the audit line. |
+| `auth_empty_cn_cert_denied` | A cert with no CN (only OU + O) reaches the plugin; policy denies on `cn != ""`; audit records `cn=""`. |
+| `fuzz_publish_payloads_keep_audit_intact` | 40 publishes from a legit operator cert with random topics (incl. unicode + injection bytes) and random payloads up to 4 KB. Asserts broker survives, audit lines stay parseable, every line within cap, ACL events carry structural fields. |
 | `reload_broken_policy_keeps_previous` | SIGHUP with a syntactically broken policy file leaves the broker up and serving under the old policy. |

@@ -94,6 +94,56 @@ def main() -> None:
     good_cert, good_serial = build_client("crl-good-alice", "crl_good_alice")
     revoked_cert, revoked_serial = build_client("crl-revoked-alice", "crl_revoked_alice")
 
+    # SSRF probe cert: identical to the good one but with a non-HTTP
+    # crlDistributionPoints URL. http_fetch.c's parse_http_url must
+    # reject schemes other than http/https; crl.check() should surface
+    # status:error rather than dereference a file://. Used by the
+    # crl_url_scheme_allowlist test.
+    if not (PKI/"crl_ssrf_alice.crt").exists():
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        save_key(key, PKI/"crl_ssrf_alice.key")
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "example"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "crl-ssrf-alice"),
+            ]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime(2024, 1, 1))
+            .not_valid_after(datetime.datetime(2034, 1, 1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=True,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+                critical=False,
+            )
+            .add_extension(
+                x509.CRLDistributionPoints([
+                    x509.DistributionPoint(
+                        full_name=[x509.UniformResourceIdentifier("file:///etc/passwd")],
+                        relative_name=None, crl_issuer=None, reasons=None,
+                    ),
+                ]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        save_cert(cert, PKI/"crl_ssrf_alice.crt")
+
     # Build a CRL signed by intermediate_a, listing the revoked cert.
     builder = (
         x509.CertificateRevocationListBuilder()

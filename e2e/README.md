@@ -62,4 +62,7 @@ paths), `policy.rego` (with fingerprints substituted), `broker.log`,
 | `ocsp_good_cert_allowed` | Cert with `status:good` from a live OCSP responder is allowed by an `ocsp.check()`-gated policy. |
 | `ocsp_revoked_cert_denied` | Cert revoked at the responder is denied by the same policy. |
 | `ocsp_responder_unreachable_fail_closed` | Same policy, responder down: `status:error` flows through Rego as deny — fail-closed. |
+| `crl_good_cert_allowed` | Cert listed nowhere in the CRL gets `status:good` from the local HTTP-served CRL and is allowed by a `crl.check()`-gated policy. |
+| `crl_revoked_cert_denied` | Cert whose serial appears in the CRL gets `status:revoked` and is denied. |
+| `crl_fetcher_unreachable_fail_closed` | Same policy, CRL HTTP server down: `status:error` → deny. |
 | `reload_broken_policy_keeps_previous` | SIGHUP with a syntactically broken policy file leaves the broker up and serving under the old policy. |

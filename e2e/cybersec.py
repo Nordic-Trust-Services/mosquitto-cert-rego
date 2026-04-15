@@ -875,6 +875,164 @@ def t_ocsp_revoked() -> None:
         _restore_policy(current_policy, previous)
 
 
+# --------------------------------------------------------------------------
+# CRL revocation
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def crl_http_server():
+    """Background Python http.server serving e2e/pki/intermediate_a.crl
+    on 127.0.0.1:18889. Yields the subprocess.Popen."""
+    import http.server  # noqa: F401  (sanity-check Python has it)
+    cmd = [
+        sys.executable, "-m", "http.server", "18889",
+        "--bind", "127.0.0.1",
+        "--directory", str(PKI),
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            probe = subprocess.run(["ss", "-ltn"], capture_output=True,
+                                   text=True, timeout=2)
+            if ":18889 " in probe.stdout:
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    else:
+        proc.kill()
+        raise TestFailure("CRL HTTP server failed to start on :18889")
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def _install_crl_policy(current_policy: pathlib.Path) -> str:
+    """Overwrite policy.rego with a policy that gates CONNECT on
+    crl.check() returning 'good' for the leaf. SIGHUPs the broker.
+    Returns the prior contents for restoration."""
+    pid = int((RUN/"broker.pid").read_text().strip())
+    previous = current_policy.read_text()
+
+    fp_a = subprocess.check_output(
+        ["openssl", "x509", "-in", str(PKI/"root_a.crt"),
+         "-noout", "-fingerprint", "-sha256"],
+        text=True,
+    ).strip().split("=", 1)[1].replace(":", "").lower()
+
+    current_policy.write_text(textwrap.dedent(f"""\
+        package mqtt
+
+        root_a_fp := "{fp_a}"
+        anchor_fp := input.cert.trust_anchor.fingerprint_sha256
+        is_operator {{ anchor_fp == root_a_fp }}
+
+        default connect := false
+        default acl := false
+
+        connect {{
+            input.cert.chain_ok
+            input.cert.cn != ""
+            is_operator
+            results := json.unmarshal(crl.check())
+            status := results[0].status
+            audit.log(sprintf("crl=%v cn=%v err=%v",
+                              [status, input.cert.cn, results[0].error]))
+            status == "good"
+        }}
+
+        acl {{ is_operator; startswith(input.acl.topic, "devices/") }}
+    """))
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.2)
+    return previous
+
+
+@test("crl_good_cert_allowed")
+def t_crl_good() -> None:
+    """With the CRL fetched from the local HTTP server saying nothing
+    about the leaf serial, the policy treats it as good and allows."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_crl_policy(current_policy)
+    try:
+        with crl_http_server():
+            reset_audit()
+            cp = do_publish("crl_good_alice.crt", "crl_good_alice.key",
+                            "crl-good", "devices/crl-good/x", "hi")
+            if cp.returncode != 0:
+                raise TestFailure(
+                    f"good CRL cert was rejected: {cp.stdout!r} / {cp.stderr!r}"
+                )
+            time.sleep(0.3)
+            notes = [l.get("note", "") for l in read_audit()
+                     if l.get("event") == "policy.note"]
+            if not any("crl=good" in n for n in notes):
+                raise TestFailure(
+                    f"expected crl=good note, got: {notes}"
+                )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("crl_revoked_cert_denied")
+def t_crl_revoked() -> None:
+    """The revoked cert's serial is listed in the CRL — crl.check returns
+    `revoked` for the leaf, the policy denies."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_crl_policy(current_policy)
+    try:
+        with crl_http_server():
+            reset_audit()
+            cp = do_publish("crl_revoked_alice.crt", "crl_revoked_alice.key",
+                            "crl-revoked", "devices/crl-revoked/x", "hi")
+            if cp.returncode == 0:
+                raise TestFailure("CRL-revoked cert was accepted!")
+            lines = wait_for_audit(
+                lambda ls: any(l.get("event") == "connect"
+                               and l.get("result") == "deny"
+                               for l in ls)
+            )
+            notes = [l.get("note", "") for l in lines
+                     if l.get("event") == "policy.note"]
+            if not any("crl=revoked" in n for n in notes):
+                raise TestFailure(
+                    f"expected crl=revoked note, got: {notes}"
+                )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
+@test("crl_fetcher_unreachable_fail_closed")
+def t_crl_unreachable() -> None:
+    """No HTTP server up. crl.check() must surface an error status; the
+    policy denies — fail-closed."""
+    current_policy = RUN/"policy.rego"
+    previous = _install_crl_policy(current_policy)
+    try:
+        reset_audit()
+        cp = do_publish("crl_good_alice.crt", "crl_good_alice.key",
+                        "crl-outage", "devices/crl-outage/x", "hi")
+        if cp.returncode == 0:
+            raise TestFailure(
+                "CRL-unreachable cert was accepted; expected fail-closed deny"
+            )
+        wait_for_audit(
+            lambda ls: any(l.get("event") == "connect"
+                           and l.get("result") == "deny"
+                           for l in ls)
+        )
+    finally:
+        _restore_policy(current_policy, previous)
+
+
 @test("ocsp_responder_unreachable_fail_closed")
 def t_ocsp_unreachable() -> None:
     """When the OCSP responder is NOT running, ocsp.check() on the leaf

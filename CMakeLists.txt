@@ -175,9 +175,27 @@ add_library(${PLUGIN_NAME} MODULE
 
 set_target_properties(${PLUGIN_NAME} PROPERTIES
 	PREFIX ""
-	C_VISIBILITY_PRESET hidden
-	CXX_VISIBILITY_PRESET hidden
 )
+
+# The mosquitto plugin API macros have no visibility attribute on non-
+# Windows, so we let default visibility carry the three plugin entry
+# points and use a linker version script to keep the rest (rego-cpp,
+# openssl, ldap wrapper internals) out of the dynamic symbol table.
+set(PLUGIN_EXPORTS "${CMAKE_CURRENT_BINARY_DIR}/plugin_exports.map")
+file(WRITE ${PLUGIN_EXPORTS}
+"{
+    global:
+        mosquitto_plugin_version;
+        mosquitto_plugin_init;
+        mosquitto_plugin_cleanup;
+    local:
+        *;
+};
+")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	target_link_options(${PLUGIN_NAME} PRIVATE
+		"LINKER:--version-script=${PLUGIN_EXPORTS}")
+endif()
 
 target_include_directories(${PLUGIN_NAME} PRIVATE
 	${MOSQUITTO_INCLUDE_DIR}
@@ -190,6 +208,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
 	${REGOCPP_LINK_LIBS}
 	${LDAP_LIBRARIES}
 	${LBER_LIBRARIES}
+	${CMAKE_DL_LIBS}
 )
 
 if(APPLE)

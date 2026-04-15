@@ -40,6 +40,8 @@ SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
  * failure leaves previous state in place.
  */
 
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1129,7 +1131,18 @@ int mosquitto_plugin_init(mosquitto_plugin_id_t *identifier, void **user_data,
 	}
 
 	plg_id = identifier;
-	mosquitto_plugin_set_info(identifier, "cert-rego", NULL);
+	/* mosquitto_plugin_set_info appeared partway through the 2.0.x series.
+	 * Older brokers (e.g. 2.0.11 in Ubuntu 22.04) don't export it. Resolve
+	 * via dlsym so the plugin still loads — the broker just shows the
+	 * generic plugin name in $SYS/plugins. */
+	{
+		void (*set_info)(mosquitto_plugin_id_t *, const char *, const char *) =
+			(void (*)(mosquitto_plugin_id_t *, const char *, const char *))
+			dlsym(RTLD_DEFAULT, "mosquitto_plugin_set_info");
+		if(set_info){
+			set_info(identifier, "cert-rego", NULL);
+		}
+	}
 
 	int rc;
 	rc = mosquitto_callback_register(plg_id, MOSQ_EVT_BASIC_AUTH,

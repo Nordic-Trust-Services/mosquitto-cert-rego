@@ -47,6 +47,9 @@ pki/
 *.csr
 *.srl
 
+# e2e runtime artefacts (broker log, stamped conf, audit log)
+e2e/run/
+
 # Audit logs
 *.log
 

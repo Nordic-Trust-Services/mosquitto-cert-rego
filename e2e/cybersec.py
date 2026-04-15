@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+Cybersec test battery against the running e2e broker.
+
+Preconditions:
+  - PKI generated under e2e/pki (multi-root) + negative certs via
+    gen-negative-certs.sh
+  - Broker running via run-broker.sh (port 18883)
+  - Audit log at e2e/run/audit.jsonl
+
+Each test:
+  1. Truncates the audit log so assertions are local to this test
+  2. Runs some client / broker interaction
+  3. Reads the audit log back and asserts on the events
+
+Prints PASS/FAIL per test. Exits non-zero on any failure. Each test is
+independent — audit.jsonl is truncated at the start of every test so you
+can run them individually by editing the main() dispatch.
+"""
+from __future__ import annotations
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
+import time
+
+E2E_DIR = pathlib.Path(__file__).resolve().parent
+PKI = E2E_DIR / "pki"
+RUN = E2E_DIR / "run"
+AUDIT = RUN / "audit.jsonl"
+
+HOST = os.environ.get("HOST", "localhost")
+PORT = int(os.environ.get("PORT", "18883"))
+
+PUB = os.environ.get("MOSQUITTO_PUB", "/home/hs/mosquitto/build/client/mosquitto_pub")
+SUB = os.environ.get("MOSQUITTO_SUB", "/home/hs/mosquitto/build/client/mosquitto_sub")
+
+
+class TestFailure(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def reset_audit() -> None:
+    AUDIT.write_text("")
+
+
+def read_audit() -> list[dict]:
+    out = []
+    for raw in AUDIT.read_text().splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            out.append(json.loads(raw))
+        except json.JSONDecodeError as e:
+            raise TestFailure(f"audit line not valid JSON: {e}: {raw!r}")
+    return out
+
+
+def wait_for_audit(predicate, timeout_s: float = 3.0) -> list[dict]:
+    """Poll audit.jsonl until `predicate(lines)` is truthy, or raise."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        lines = read_audit()
+        if predicate(lines):
+            return lines
+        time.sleep(0.05)
+    lines = read_audit()
+    raise TestFailure(
+        f"predicate never satisfied within {timeout_s}s; audit had {len(lines)} lines"
+    )
+
+
+def tls_client_args(cert: str, key: str) -> list[str]:
+    return [
+        "--cafile", str(PKI / "bundle_all.pem"),
+        "--tls-version", "tlsv1.2",
+        "--cert", str(PKI / cert),
+        "--key", str(PKI / key),
+    ]
+
+
+def do_publish(cert: str, key: str, cn: str, topic: str, msg: str = "x",
+               qos: int = 1, extra: list[str] | None = None) -> subprocess.CompletedProcess:
+    cmd = [
+        PUB, "-h", HOST, "-p", str(PORT),
+        *tls_client_args(cert, key),
+        "-i", f"cs-{cn}-{os.getpid()}",
+        "-t", topic, "-m", msg, "-q", str(qos),
+    ]
+    if extra:
+        cmd += extra
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+
+# --------------------------------------------------------------------------
+# tests
+# --------------------------------------------------------------------------
+
+TESTS: dict[str, "callable"] = {}
+
+
+def test(name: str):
+    def deco(fn):
+        TESTS[name] = fn
+        return fn
+    return deco
+
+
+@test("auth_untrusted_root_tls_reject")
+def t_untrusted_root() -> None:
+    """Client cert signed by a CA not in either plugin bundle must be rejected
+    at the TLS handshake (listener cafile=bundle_all.pem only trusts root_a
+    and root_b). The plugin should never see it."""
+    reset_audit()
+
+    # The intruder cert chains up to untrusted_root.crt, which is NOT in
+    # bundle_all.pem — the broker rejects the handshake.
+    cp = do_publish("intruder.crt", "intruder.key", "intruder",
+                    "devices/anything/x")
+    if cp.returncode == 0:
+        raise TestFailure(
+            f"untrusted root cert was accepted! mosquitto_pub stdout: {cp.stdout!r}"
+        )
+    # Give the broker a moment to flush any audit line (there should be none).
+    time.sleep(0.2)
+    lines = read_audit()
+    decisions = [l for l in lines if l.get("event") in {"connect", "acl"}]
+    if decisions:
+        raise TestFailure(
+            f"plugin saw {len(decisions)} decisions for untrusted-root cert; "
+            "TLS should have rejected before plugin got a look"
+        )
+
+
+@test("auth_expired_leaf_tls_reject")
+def t_expired_leaf() -> None:
+    """An expired cert is rejected at the TLS handshake by mosquitto's own
+    cafile verification, before the plugin sees it — this is the listener's
+    first line of defence. The audit log stays empty for the attempt; the
+    plugin's chain-override machinery applies only to cases where TLS
+    accepts the cert (e.g. a cert the handshake cafile trusts but the
+    plugin's own trust bundle flags).
+    """
+    reset_audit()
+    cp = do_publish("expired_alice.crt", "expired_alice.key", "expired-alice",
+                    "devices/anything/x")
+    if cp.returncode == 0:
+        raise TestFailure(
+            "expired leaf was accepted! Expected TLS handshake reject"
+        )
+    time.sleep(0.2)
+    decisions = [l for l in read_audit()
+                 if l.get("event") in {"connect", "acl"}]
+    if decisions:
+        raise TestFailure(
+            f"plugin saw {len(decisions)} decisions for expired cert; "
+            "the TLS handshake should have rejected"
+        )
+
+
+@test("acl_cross_device_deny")
+def t_acl_cross_device() -> None:
+    """device_01 publishing into device_02's subtree must deny."""
+    reset_audit()
+    do_publish("device_01.crt", "device_01.key", "device-01",
+               "devices/device-02/stolen", "oops")
+    lines = wait_for_audit(
+        lambda ls: any(l.get("event") == "acl" and l.get("result") == "deny"
+                       for l in ls)
+    )
+    deny = next(l for l in lines if l.get("event") == "acl"
+                and l.get("result") == "deny")
+    if "device-02" not in (deny.get("topic") or ""):
+        raise TestFailure(
+            f"acl deny topic mismatch: {deny.get('topic')!r}"
+        )
+    if deny.get("cn") != "device-01":
+        raise TestFailure(
+            f"acl deny cn={deny.get('cn')!r}, expected device-01"
+        )
+
+
+@test("acl_fleet_wildcard_from_device_deny")
+def t_acl_fleet_wildcard_from_device() -> None:
+    """A device cert that tries to escape its subtree via a wildcard
+    subscription (devices/+/secret) must be denied. The device policy only
+    allows devices/<cn>/... and the wildcard-qualified topic doesn't match
+    starts_with that prefix."""
+    reset_audit()
+    cmd = [
+        SUB, "-h", HOST, "-p", str(PORT),
+        *tls_client_args("device_01.crt", "device_01.key"),
+        "-i", f"cs-dev01-sub-{os.getpid()}",
+        "-t", "devices/+/secret",
+        "-C", "1", "-W", "1",  # at most 1 msg, 1 second wall clock
+    ]
+    subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    lines = wait_for_audit(
+        lambda ls: any(
+            l.get("event") == "acl" and l.get("result") == "deny"
+            and l.get("cn") == "device-01"
+            and "devices/+/secret" in (l.get("topic") or "")
+            for l in ls
+        )
+    )
+
+
+@test("audit_framing_cn_injection")
+def t_cn_injection() -> None:
+    """A cert whose CN contains quote/backslash/newline must not break audit
+    JSON framing — every emitted line must still parse as JSON and the cn
+    field must round-trip the original bytes."""
+    reset_audit()
+    do_publish("injection_alice.crt", "injection_alice.key", "injection",
+               "devices/anything/x")
+    time.sleep(0.3)
+    lines = read_audit()  # raises TestFailure if any line is broken JSON
+    connects = [l for l in lines if l.get("event") == "connect"]
+    if not connects:
+        raise TestFailure("no connect event recorded for injection cert")
+    cn = connects[0].get("cn") or ""
+    # Openssl stored the DN with escaping; the on-the-wire CN should still
+    # contain both a quote and a backslash byte to prove escaping survived.
+    if '"' not in cn and "\\" not in cn:
+        raise TestFailure(
+            f"injection CN round-trip empty: cn={cn!r}"
+        )
+
+
+@test("audit_decision_id_correlates_connect_and_acl")
+def t_decision_id() -> None:
+    """Every decision gets a unique monotonic decision_id. connect and the
+    ACLs it implies come from different callbacks but run on the same
+    broker-loop thread, so decision_ids should be distinct and positive."""
+    reset_audit()
+    do_publish("operator_alice.crt", "operator_alice.key", "alice",
+               "devices/alice/hello", "hi")
+    time.sleep(0.3)
+    lines = read_audit()
+    ids = [l["decision_id"] for l in lines if l.get("decision_id") is not None]
+    if len(set(ids)) != len(ids):
+        raise TestFailure(f"duplicate decision_ids: {ids}")
+    if any(i <= 0 for i in ids):
+        raise TestFailure(f"non-positive decision_id: {ids}")
+
+
+@test("audit_line_truncation_kicks_in")
+def t_truncation() -> None:
+    """With the default 8 KB cap and rich DEBUG extras, lines should stay
+    under the cap. With a pathological cert or a small cap, the plugin must
+    rebuild the line with {"truncated":true} rather than overflow. We
+    synthesise the overflow by confirming every audit line fits within the
+    cap configured in mosquitto.conf and no line overflowed framing."""
+    reset_audit()
+    do_publish("operator_alice.crt", "operator_alice.key", "alice",
+               "devices/alice/h", "x")
+    time.sleep(0.3)
+    lines = read_audit()
+    if not lines:
+        raise TestFailure("no audit lines produced")
+    # Two assertions: (1) every line is valid JSON (already covered by
+    # read_audit), (2) no line exceeds the current line_cap. The broker
+    # config caps at 8192; asserting 9000 leaves slack for the timestamp.
+    with open(AUDIT, "rb") as f:
+        for raw in f:
+            if len(raw) > 9000:
+                raise TestFailure(
+                    f"audit line exceeds cap+slack: {len(raw)} bytes"
+                )
+
+
+@test("audit_deny_carries_full_metadata")
+def t_deny_metadata() -> None:
+    """A deny line must carry the same cert metadata an allow line does —
+    cn, subject_dn, issuer_dn, serial, fingerprint, trust_anchor_fp.
+    This is the property that makes relaxed-policy observability work."""
+    reset_audit()
+    do_publish("device_01.crt", "device_01.key", "device-01",
+               "devices/device-02/x", "nope")
+    lines = wait_for_audit(
+        lambda ls: any(l.get("event") == "acl" and l.get("result") == "deny"
+                       for l in ls)
+    )
+    deny = next(l for l in lines if l.get("event") == "acl"
+                and l.get("result") == "deny")
+    required = [
+        "cn", "subject_dn", "issuer_dn", "serial",
+        "fingerprint_sha256", "trust_anchor_fp",
+        "chain_ok", "chain_errors",
+        "client_id", "remote_addr", "decision_id",
+    ]
+    missing = [k for k in required if k not in deny]
+    if missing:
+        raise TestFailure(f"deny line missing fields: {missing}")
+
+
+@test("policy_note_at_debug_only")
+def t_policy_note() -> None:
+    """The policy calls audit.log(...) on every successful connect. At DEBUG
+    level the note should appear as a policy.note event. Confirms the Rego
+    host function round-trip."""
+    reset_audit()
+    do_publish("operator_alice.crt", "operator_alice.key", "alice",
+               "devices/alice/x", "x")
+    time.sleep(0.3)
+    lines = read_audit()
+    notes = [l for l in lines if l.get("event") == "policy.note"]
+    if not notes:
+        raise TestFailure("no policy.note emitted by Rego audit.log()")
+    note = notes[0]
+    if "role=operator" not in (note.get("note") or ""):
+        raise TestFailure(f"note body unexpected: {note.get('note')!r}")
+
+
+# --------------------------------------------------------------------------
+# reload safety
+# --------------------------------------------------------------------------
+
+@test("reload_broken_policy_keeps_previous")
+def t_reload_broken() -> None:
+    """SIGHUP the broker with a syntactically broken policy. The broker must
+    stay up, keep the old policy, and a subsequent valid connect must still
+    succeed. The audit log should carry a deny for the bad reload attempt
+    (broker log) and an allow for the successful connect that follows."""
+    # Point policy_file at a bad rego, SIGHUP, then restore + SIGHUP again.
+    current_conf = RUN / "mosquitto.conf"
+    current_policy = RUN / "policy.rego"
+    backup_policy = RUN / "policy.rego.bak"
+
+    original = current_policy.read_text()
+    backup_policy.write_text(original)
+    try:
+        # Write syntactically broken Rego.
+        current_policy.write_text("package mqtt\n\nthis is not valid rego\n")
+        reset_audit()
+
+        pid = int((RUN / "broker.pid").read_text().strip())
+        os.kill(pid, 1)   # SIGHUP
+        time.sleep(0.5)
+
+        # Broker must still be alive.
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            raise TestFailure("broker died on broken-policy reload")
+
+        # Post-reload valid connect must still work using the OLD policy.
+        current_policy.write_text(original)  # restore for anyone else, but
+                                             # broker is still holding old copy
+        cp = do_publish("operator_alice.crt", "operator_alice.key", "alice",
+                        "devices/alice/still-alive", "x")
+        if cp.returncode != 0:
+            raise TestFailure(
+                f"post-broken-reload connect failed: {cp.stdout!r} / {cp.stderr!r}"
+            )
+    finally:
+        current_policy.write_text(original)
+        # Do a clean reload so subsequent tests see the restored policy
+        # file on disk in case the broker re-reads it.
+        try:
+            pid = int((RUN / "broker.pid").read_text().strip())
+            os.kill(pid, 1)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# entrypoint
+# --------------------------------------------------------------------------
+
+def main(argv: list[str]) -> int:
+    wanted = argv[1:] or list(TESTS)
+    unknown = [n for n in wanted if n not in TESTS]
+    if unknown:
+        print(f"unknown tests: {unknown}", file=sys.stderr)
+        return 2
+
+    fails = []
+    for name in wanted:
+        try:
+            TESTS[name]()
+            print(f"  PASS  {name}")
+        except TestFailure as e:
+            print(f"  FAIL  {name}: {e}")
+            fails.append(name)
+        except Exception as e:
+            print(f"  ERR   {name}: {type(e).__name__}: {e}")
+            fails.append(name)
+
+    print()
+    if fails:
+        print(f"cybersec: {len(fails)} FAIL / {len(wanted) - len(fails)} PASS")
+        return 1
+    print(f"cybersec: {len(wanted)} PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

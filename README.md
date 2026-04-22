@@ -74,6 +74,7 @@ Eight progressively richer policies under [examples/](examples/):
 7. [`07_crl_in_rego.rego`](examples/07_crl_in_rego.rego) — CRL revocation, optionally combined with OCSP
 8. [`08_chain_traversal.rego`](examples/08_chain_traversal.rego) — overriding specific chain-verification failures
 9. [`09_degraded_scope_on_expired.rego`](examples/09_degraded_scope_on_expired.rego) — graceful degradation on an expired chain
+10. [`10_san_uri_roles.rego`](examples/10_san_uri_roles.rego) — role-based access from `urn:` SAN URIs (admin / fleet / reader)
 
 ## Testing
 

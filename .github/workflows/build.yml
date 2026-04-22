@@ -24,6 +24,8 @@ jobs:
       REGOCPP_REF: main
       REGOCPP_PREFIX: ${{ github.workspace }}/regocpp-install
       REGOCPP_BUILD:  ${{ github.workspace }}/regocpp-build
+      MOSQUITTO_REF: v2.1.2
+      MOSQUITTO_SRC: ${{ github.workspace }}/mosquitto-src
       BUILD_DIR:      ${{ github.workspace }}/build
 
     steps:
@@ -35,7 +37,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake ninja-build git \
-            libssl-dev libcjson-dev libldap2-dev libmosquitto-dev
+            libssl-dev libcjson-dev libldap2-dev
+
+      # Ubuntu's libmosquitto-dev package only ships the client header
+      # (mosquitto.h) — the broker plugin API (mosquitto/broker.h,
+      # MOSQUITTO_PLUGIN_DECLARE_VERSION, mosquitto_plugin_id_t, MOSQ_EVT_*,
+      # struct mosquitto_evt_*) lives in the broker source tree under
+      # include/mosquitto/. We clone upstream at a pinned tag and just use
+      # the headers in-place; no install required.
+      - name: Cache mosquitto source headers
+        id: mosquitto-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MOSQUITTO_SRC }}
+          key: mosquitto-src-${{ env.MOSQUITTO_REF }}
+
+      - name: Fetch mosquitto source
+        if: steps.mosquitto-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch $MOSQUITTO_REF \
+              https://github.com/eclipse/mosquitto.git $MOSQUITTO_SRC
 
       - name: Resolve rego-cpp SHA
         id: regocpp-sha
@@ -76,7 +97,8 @@ jobs:
         run: |
           cmake -B $BUILD_DIR -S . -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
-              -DREGOCPP_ROOT=$REGOCPP_PREFIX
+              -DREGOCPP_ROOT=$REGOCPP_PREFIX \
+              -DMOSQUITTO_INCLUDE_DIR=$MOSQUITTO_SRC/include
 
       - name: Build
         run: cmake --build $BUILD_DIR -j

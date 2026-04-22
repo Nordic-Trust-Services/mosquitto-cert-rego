@@ -90,7 +90,12 @@ Eight progressively richer policies under [examples/](examples/):
 - [e2e/README.md](e2e/README.md) — end-to-end test harness and cybersec suite
 - [test.conf](test.conf) — annotated mosquitto config with every plugin option
 - [CONTRIBUTING.md](CONTRIBUTING.md) — patches welcome
+- [SUPPORT.md](SUPPORT.md) — commercial support and services from Nordic Trust Services
+
+## Commercial support
+
+The open-source code in this repository is free to use under the terms below. If you want installation help, a phone number to call when something goes wrong, or custom features built on top, **Nordic Trust Services** offers paid support and services — see [SUPPORT.md](SUPPORT.md).
 
 ## License
 
-EPL-2.0 OR BSD-3-Clause, matching upstream mosquitto's first-class plugins.
+EPL-2.0 OR BSD-3-Clause, matching upstream mosquitto's first-class plugins. "Nordic Trust Services" is a trademark; see [SUPPORT.md](SUPPORT.md#trademark-notice) for use guidelines.

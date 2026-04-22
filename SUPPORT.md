@@ -20,10 +20,10 @@ Running it in a production MQTT broker is also a fine moment to have a phone num
 ## Getting in touch
 
 - Project issues / bug reports / open-source discussion: GitHub issues on this repository.
-- Commercial inquiries: contact Nordic Trust Services via the channel listed on our site (fill in once published — email, form, whatever).
+- Commercial inquiries: contact Nordic Trust Services via the channel listed on our site (https://www.nordictrustservices.com).
 
 ## Trademark notice
 
-"Nordic Trust Services" is a trademark of Nordic Trust Services. Forks, packages, and derivative works may freely use the code under the applicable open-source license, but may not use the Nordic Trust Services name or logo in a way that implies endorsement or affiliation without prior written permission.
+"Nordic Trust Services" is a trademark of Nordic Trust Services AB. Forks, packages, and derivative works may freely use the code under the applicable open-source license, but may not use the Nordic Trust Services name or logo in a way that implies endorsement or affiliation without prior written permission.
 
 The name of this project (`mosquitto_cert_rego`) is not a Nordic Trust Services trademark and may be used in fork names, packages, etc. subject to the open-source license terms.

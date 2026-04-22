@@ -332,7 +332,7 @@ def t_san_uri_role() -> None:
     intermediate_a with
 
         X509v3 Subject Alternative Name:
-            URI: urn:sundelininstruments:role:admin
+            URI: urn:iotwidgits:role:admin
 
     SIGHUP-installs a policy that grants admin-only access to a protected
     topic based on that URN. Connect + publish must succeed; a second
@@ -388,7 +388,7 @@ def t_san_uri_role() -> None:
         (RUN/f"{out}.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
         (RUN/f"{out}.crt").chmod(0o644)
 
-    admin_urn = "urn:sundelininstruments:role:admin"
+    admin_urn = "urn:iotwidgits:role:admin"
     mint("henri-admin", [admin_urn], "san_admin")
     mint("henri-noroles", [],         "san_noroles")
 

@@ -486,6 +486,192 @@ def t_san_uri_role() -> None:
         time.sleep(0.2)
 
 
+@test("auth_rbac_matrix_allow_and_deny")
+def t_rbac_matrix() -> None:
+    """Walk the example 11 RBAC matrix end-to-end: mint a cert per role
+    (admin / operator / viewer / device / unknown / admin-no-fleet),
+    install examples/11_rbac_matrix.rego via SIGHUP, then probe a table
+    of (cert, action, topic, expected) tuples. Covers both positive
+    (rule fires) and negative (default-deny catches) cases, including
+    cross-tenant isolation and CN-bound telemetry scoping."""
+    import datetime as _dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+    ca_cert = x509.load_pem_x509_certificate((PKI/"intermediate_a.crt").read_bytes())
+    ca_key  = serialization.load_pem_private_key((PKI/"intermediate_a.key").read_bytes(), password=None)
+
+    def mint(cn: str, sans: list[str], out: str) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        (RUN/f"{out}.key").write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+        (RUN/f"{out}.key").chmod(0o600)
+        b = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "example"),
+                x509.NameAttribute(NameOID.COMMON_NAME, cn),
+            ]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_dt.datetime(2024, 1, 1))
+            .not_valid_after(_dt.datetime(2034, 1, 1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=True,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        )
+        if sans:
+            b = b.add_extension(
+                x509.SubjectAlternativeName([x509.UniformResourceIdentifier(u) for u in sans]),
+                critical=False,
+            )
+        cert = b.sign(ca_key, hashes.SHA256())
+        (RUN/f"{out}.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        (RUN/f"{out}.crt").chmod(0o644)
+
+    R = "urn:iotwidgits:role:"
+    F = "urn:iotwidgits:fleet:"
+    mint("admin-a",        [R+"admin",    F+"north"], "rbac_admin")
+    mint("operator-a",     [R+"operator", F+"north"], "rbac_operator")
+    mint("viewer-a",       [R+"viewer",   F+"north"], "rbac_viewer")
+    mint("device-n01",     [R+"device",   F+"north"], "rbac_device")
+    mint("nobody",         [R+"reader"],              "rbac_unknown_role")
+    mint("admin-nofleet",  [R+"admin"],               "rbac_admin_nofleet")
+
+    # Install the matrix policy.
+    current_policy = RUN/"policy.rego"
+    previous = current_policy.read_text()
+    pid = int((RUN/"broker.pid").read_text().strip())
+    example_rbac = (pathlib.Path(__file__).resolve().parent.parent
+                    / "examples" / "11_rbac_matrix.rego")
+    current_policy.write_text(example_rbac.read_text())
+    os.kill(pid, signal.SIGHUP)
+    time.sleep(0.25)
+
+    try:
+        # -------- positive cases (expect returncode == 0) -----------
+        positives = [
+            # (cert_out, cn, action, topic)
+            ("rbac_admin",        "admin-a",      "write",     "ops/cmd/start"),
+            ("rbac_admin",        "admin-a",      "write",     "config/rotate"),
+            ("rbac_admin",        "admin-a",      "subscribe", "$SYS/broker/uptime"),
+            ("rbac_admin",        "admin-a",      "write",     "fleet/north/alarm"),
+            ("rbac_operator",     "operator-a",   "write",     "ops/cmd/ack/42"),
+            ("rbac_operator",     "operator-a",   "subscribe", "ops/status/all"),
+            ("rbac_operator",     "operator-a",   "write",     "fleet/north/note"),
+            ("rbac_viewer",       "viewer-a",     "subscribe", "ops/status/all"),
+            ("rbac_device",       "device-n01",   "write",     "ops/status/device-n01/heartbeat"),
+            ("rbac_device",       "device-n01",   "write",     "fleet/north/mutual"),
+        ]
+
+        # -------- negative cases (expect returncode != 0) -----------
+        # Each exercises a different "unless" clause in the matrix.
+        negatives = [
+            ("rbac_viewer",        "viewer-a",     "write",     "ops/cmd/start",      "viewer-has-no-publish"),
+            ("rbac_operator",      "operator-a",   "write",     "config/secret",      "operator-lacks-config"),
+            ("rbac_operator",      "operator-a",   "write",     "ops/cmd/start",      "operator-only-ack"),
+            ("rbac_device",        "device-n01",   "write",     "ops/status/device-n02/x", "device-cn-binding"),
+            ("rbac_device",        "device-n01",   "subscribe", "$SYS/broker/uptime", "device-no-sys"),
+            ("rbac_admin_nofleet", "admin-nofleet","subscribe", "fleet/north/bus",    "admin-fleet-membership-req"),
+            ("rbac_admin",         "admin-a",      "write",     "fleet/south/bus",    "admin-cross-tenant"),
+        ]
+
+        # mosquitto_pub returns 0 at QoS 1 even when the broker silently
+        # drops an ACL-denied publish (broker still PUBACKs), and
+        # mosquitto_sub returns non-zero on wait-time expiry regardless
+        # of whether the subscribe itself was allowed. So we assert on
+        # the audit log, not on the client's exit code.
+        def run_probe(out: str, cn: str, action: str, topic: str, idx: int) -> str:
+            client_id = f"rbac-{idx}"
+            args = [
+                "-h", HOST, "-p", str(PORT),
+                "--cafile", str(PKI/"bundle_all.pem"),
+                "--tls-version", "tlsv1.2",
+                "--cert", str(RUN/f"{out}.crt"), "--key", str(RUN/f"{out}.key"),
+                "-i", client_id, "--quiet",
+            ]
+            if action == "subscribe":
+                cmd = [SUB] + args + ["-t", topic, "-C", "1", "-W", "1"]
+            else:
+                # "write" is the broker's action name for a client publish.
+                cmd = [PUB] + args + ["-t", topic, "-m", "x", "-q", "1"]
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+            except subprocess.TimeoutExpired:
+                pass
+            return client_id
+
+        def audit_outcomes(client_id: str, action: str, topic: str) -> tuple[str | None, str | None]:
+            """Return (connect_result, acl_result_for_this_topic) or None/None."""
+            # flush a moment for fsync-per-line audit to catch up
+            time.sleep(0.15)
+            lines = read_audit()
+            connect_r = None
+            acl_r = None
+            for l in lines:
+                if l.get("client_id") != client_id:
+                    continue
+                if l.get("event") == "connect":
+                    connect_r = l.get("result")
+                elif (l.get("event") == "acl"
+                      and l.get("action") == action
+                      and l.get("topic") == topic):
+                    acl_r = l.get("result")
+            return connect_r, acl_r
+
+        fails = []
+        idx = 0
+        reset_audit()
+
+        # 1. Unknown role canary — connect should deny.
+        cid = run_probe("rbac_unknown_role", "nobody", "publish", "ops/cmd/x", idx); idx += 1
+        c, _ = audit_outcomes(cid, "publish", "ops/cmd/x")
+        if c != "deny":
+            fails.append(f"unknown role: connect={c!r}, expected deny")
+
+        # 2. Positives — connect allow + matching ACL allow.
+        for cert, cn, action, topic in positives:
+            cid = run_probe(cert, cn, action, topic, idx); idx += 1
+            c, a = audit_outcomes(cid, action, topic)
+            if c != "allow":
+                fails.append(f"POS {cn}/{action}/{topic}: connect={c!r}, want allow")
+            elif a != "allow":
+                fails.append(f"POS {cn}/{action}/{topic}: acl={a!r}, want allow")
+
+        # 3. Negatives — connect allow (cert has a known role), ACL deny.
+        for cert, cn, action, topic, reason in negatives:
+            cid = run_probe(cert, cn, action, topic, idx); idx += 1
+            c, a = audit_outcomes(cid, action, topic)
+            if c != "allow":
+                fails.append(f"NEG {reason}: connect={c!r}, want allow (cert has role)")
+            elif a != "deny":
+                fails.append(f"NEG {reason}: acl={a!r}, want deny")
+
+        if fails:
+            raise TestFailure("\n  " + "\n  ".join(fails))
+
+    finally:
+        current_policy.write_text(previous)
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.2)
+
+
 @test("audit_framing_cn_injection")
 def t_cn_injection() -> None:
     """A cert whose CN contains quote/backslash/newline must not break audit

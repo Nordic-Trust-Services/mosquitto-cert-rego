@@ -52,8 +52,10 @@ is_admin  { roles["admin"] }
 is_reader { roles["reader"] }
 
 # Partial "any known role" — the baseline for allowing connect.
+# rego-cpp is v0 dialect: iterate a set by binding via set-membership form,
+# not the v1 `some x in set` keyword.
 has_any_role {
-    some _ in roles
+    roles[_]
 }
 
 # ---- connect ----------------------------------------------------------
@@ -81,7 +83,7 @@ acl {
 # Fleet: per-fleet subtree (read or write). Each fleet the cert carries
 # contributes its own allow.
 acl {
-    some fleet in fleets
+    fleets[fleet]
     startswith(input.acl.topic, sprintf("fleet/%s/", [fleet]))
 }
 

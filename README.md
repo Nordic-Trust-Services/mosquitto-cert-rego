@@ -75,6 +75,7 @@ Eight progressively richer policies under [examples/](examples/):
 8. [`08_chain_traversal.rego`](examples/08_chain_traversal.rego) — overriding specific chain-verification failures
 9. [`09_degraded_scope_on_expired.rego`](examples/09_degraded_scope_on_expired.rego) — graceful degradation on an expired chain
 10. [`10_san_uri_roles.rego`](examples/10_san_uri_roles.rego) — role-based access from `urn:` SAN URIs (admin / fleet / reader)
+11. [`11_rbac_matrix.rego`](examples/11_rbac_matrix.rego) — full RBAC matrix: four roles × five topic namespaces, action-level differentiation, explicit negative cases annotated inline
 
 ## Testing
 

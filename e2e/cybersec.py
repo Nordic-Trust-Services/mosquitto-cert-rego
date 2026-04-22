@@ -325,6 +325,167 @@ def t_empty_cn() -> None:
         )
 
 
+@test("auth_san_uri_role_based_rule")
+def t_san_uri_role() -> None:
+    """Verify SAN URIs flow into input.cert.san.uri so policies can drive
+    role-based access from urn:-shaped URIs. Mints a cert signed by
+    intermediate_a with
+
+        X509v3 Subject Alternative Name:
+            URI: urn:sundelininstruments:role:admin
+
+    SIGHUP-installs a policy that grants admin-only access to a protected
+    topic based on that URN. Connect + publish must succeed; a second
+    connect with a cert lacking the admin URN must be denied."""
+    import datetime as _dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+    ca_cert = x509.load_pem_x509_certificate((PKI/"intermediate_a.crt").read_bytes())
+    ca_key  = serialization.load_pem_private_key((PKI/"intermediate_a.key").read_bytes(), password=None)
+
+    def mint(cn: str, uris: list[str], out: str) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        (RUN/f"{out}.key").write_bytes(
+            key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+        (RUN/f"{out}.key").chmod(0o600)
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "example"),
+                x509.NameAttribute(NameOID.COMMON_NAME, cn),
+            ]))
+            .issuer_name(ca_cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(_dt.datetime(2024, 1, 1))
+            .not_valid_after(_dt.datetime(2034, 1, 1))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(
+                    digital_signature=True, content_commitment=False, key_encipherment=True,
+                    data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                    crl_sign=False, encipher_only=False, decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
+        )
+        if uris:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName([x509.UniformResourceIdentifier(u) for u in uris]),
+                critical=False,
+            )
+        cert = builder.sign(ca_key, hashes.SHA256())
+        (RUN/f"{out}.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        (RUN/f"{out}.crt").chmod(0o644)
+
+    admin_urn = "urn:sundelininstruments:role:admin"
+    mint("henri-admin", [admin_urn], "san_admin")
+    mint("henri-noroles", [],         "san_noroles")
+
+    # Swap in a role-based policy.
+    current_policy = RUN/"policy.rego"
+    previous = current_policy.read_text()
+    pid = int((RUN/"broker.pid").read_text().strip())
+    try:
+        current_policy.write_text(textwrap.dedent(f"""\
+            package mqtt
+
+            default connect := false
+            default acl := false
+
+            required_role := "{admin_urn}"
+
+            has_admin_role {{
+                some i
+                input.cert.san.uri[i] == required_role
+            }}
+
+            connect {{
+                input.cert.chain_ok
+                input.cert.cn != ""
+                has_admin_role
+                audit.log(sprintf("role=admin cn=%v", [input.cert.cn]))
+            }}
+
+            acl {{
+                has_admin_role
+                startswith(input.acl.topic, "admin/")
+            }}
+        """))
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.2)
+
+        reset_audit()
+
+        # 1. Admin cert must connect + publish under admin/*.
+        cmd_ok = [
+            PUB, "-h", HOST, "-p", str(PORT),
+            "--cafile", str(PKI/"bundle_all.pem"),
+            "--tls-version", "tlsv1.2",
+            "--cert", str(RUN/"san_admin.crt"), "--key", str(RUN/"san_admin.key"),
+            "-i", "san-admin", "-t", "admin/control/x", "-m", "hi", "-q", "1", "--quiet",
+        ]
+        cp = subprocess.run(cmd_ok, capture_output=True, text=True, timeout=10)
+        if cp.returncode != 0:
+            raise TestFailure(
+                f"admin-URN cert was rejected: {cp.stdout!r} / {cp.stderr!r}"
+            )
+
+        # 2. Cert without the admin URN must be denied.
+        cmd_deny = [
+            PUB, "-h", HOST, "-p", str(PORT),
+            "--cafile", str(PKI/"bundle_all.pem"),
+            "--tls-version", "tlsv1.2",
+            "--cert", str(RUN/"san_noroles.crt"), "--key", str(RUN/"san_noroles.key"),
+            "-i", "san-noroles", "-t", "admin/control/x", "-m", "nope", "-q", "1", "--quiet",
+        ]
+        cp = subprocess.run(cmd_deny, capture_output=True, text=True, timeout=10)
+        if cp.returncode == 0:
+            raise TestFailure(
+                "cert without admin URN was allowed — role check not enforcing"
+            )
+
+        time.sleep(0.2)
+        lines = read_audit()
+
+        # 3. Admin cert's connect audit line must carry the URN in its
+        #    san.uri array (visible at DEBUG level, where we are).
+        connects = [l for l in lines if l.get("event") == "connect"]
+        admin_connect = next(
+            (l for l in connects
+             if l.get("result") == "allow" and l.get("cn") == "henri-admin"),
+            None,
+        )
+        if not admin_connect:
+            raise TestFailure("no admin allow in audit")
+        sans = (admin_connect.get("san") or {}).get("uri", [])
+        if admin_urn not in sans:
+            raise TestFailure(
+                f"audit didn't surface admin URN in san.uri; got {sans!r}"
+            )
+
+        # 4. policy.note confirms the rego side saw the role.
+        notes = [l.get("note", "") for l in lines if l.get("event") == "policy.note"]
+        if not any("role=admin" in n and "henri-admin" in n for n in notes):
+            raise TestFailure(
+                f"policy never matched has_admin_role; notes={notes}"
+            )
+    finally:
+        current_policy.write_text(previous)
+        os.kill(pid, signal.SIGHUP)
+        time.sleep(0.2)
+
+
 @test("audit_framing_cn_injection")
 def t_cn_injection() -> None:
     """A cert whose CN contains quote/backslash/newline must not break audit
@@ -1486,6 +1647,9 @@ def t_crl_unreachable() -> None:
     current_policy = RUN/"policy.rego"
     previous = _install_crl_policy(current_policy)
     try:
+        # Wait out any cached "good" from a prior test against the same
+        # cert — the e2e config sets crl_fetch_cache_ttl=1.
+        time.sleep(1.5)
         reset_audit()
         cp = do_publish("crl_good_alice.crt", "crl_good_alice.key",
                         "crl-outage", "devices/crl-outage/x", "hi")
